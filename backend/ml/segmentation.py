@@ -1,97 +1,233 @@
 """
-Customer Segmentation: RFM scoring + K-Means clustering
-"""
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from datetime import date
+Customer segmentation: RFM scoring + K-Means clustering.
 
+Each customer gets a Recency / Frequency / Monetary profile, K-Means groups
+them into up to four behaviour clusters, and the clusters are ranked and
+labelled deterministically (Champions, At-Risk, New / Growing, Lost).
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 SEGMENT_LABELS = {
-    0: {"name": "Champions",    "color": "#10b981", "description": "High value, frequent buyers, recent purchases"},
-    1: {"name": "At-Risk",      "color": "#f59e0b", "description": "Past high-spenders now going inactive"},
-    2: {"name": "New / Growing","color": "#6366f1", "description": "Recent buyers with growing potential"},
-    3: {"name": "Lost",         "color": "#ef4444", "description": "Inactive customers, low frequency and spend"},
+    "Champions": {
+        "rank": 0,
+        "color": "#000000",
+        "description": "Bought recently, purchase often and spend the most.",
+    },
+    "New / Growing": {
+        "rank": 1,
+        "color": "#374151",
+        "description": "Recent buyers with low frequency and clear upside.",
+    },
+    "At-Risk": {
+        "rank": 2,
+        "color": "#6b7280",
+        "description": "Historically valuable customers who have gone quiet.",
+    },
+    "Lost": {
+        "rank": 3,
+        "color": "#9ca3af",
+        "description": "Long inactive, low frequency and low spend.",
+    },
 }
 
 
-def compute_rfm(orders_df: pd.DataFrame, snapshot_date=None) -> pd.DataFrame:
-    """
-    Compute Recency, Frequency, Monetary scores per customer.
-
-    Args:
-        orders_df: DataFrame with [order_date, order_id, customer_id, sales].
-        snapshot_date: Reference date for recency. Defaults to the latest order date.
-    """
+def compute_rfm(orders_df: pd.DataFrame) -> pd.DataFrame:
+    """Recency / frequency / monetary metrics per customer."""
     orders_df = orders_df.copy()
     orders_df["order_date"] = pd.to_datetime(orders_df["order_date"])
+    snapshot = orders_df["order_date"].max()
 
-    if snapshot_date is None:
-        snap = orders_df["order_date"].max()
-    else:
-        # Ensure idempotent — works whether snapshot_date is a date, str, or Timestamp
-        snap = pd.Timestamp(snapshot_date)
-
-    rfm = orders_df.groupby("customer_id").agg(
-        recency=("order_date", lambda x: (snap - x.max()).days),
-        frequency=("order_id", "nunique"),
-        monetary=("sales", "sum"),
-    ).reset_index()
-
-    rfm["recency"] = rfm["recency"].clip(upper=730)
+    rfm = (
+        orders_df.groupby("customer_id")
+        .agg(
+            recency=("order_date", lambda x: (snapshot - x.max()).days),
+            frequency=("order_id", "nunique"),
+            monetary=("sales", "sum"),
+            quantity=("quantity", "sum"),
+            avg_discount=("discount", "mean"),
+        )
+        .reset_index()
+    )
     rfm["monetary"] = rfm["monetary"].round(2)
+    rfm["avg_order_value"] = np.where(
+        rfm["frequency"] > 0, rfm["monetary"] / rfm["frequency"], 0.0
+    ).round(2)
+
+    # Quintile RFM scores (1 = worst, 5 = best) so clustering is not dominated
+    # by the raw monetary scale and segment sizes stay meaningful.
+    rfm["r_score"] = _quintile_score(-rfm["recency"])
+    rfm["f_score"] = _quintile_score(rfm["frequency"])
+    rfm["m_score"] = _quintile_score(rfm["monetary"])
     return rfm
 
 
-def run_segmentation(orders_df: pd.DataFrame) -> dict:
+def _quintile_score(values: pd.Series) -> pd.Series:
+    """Map a numeric series onto 1–5 quintile scores (higher = better)."""
+    try:
+        ranks = values.rank(method="first")
+        scored = pd.qcut(ranks, 5, labels=[1, 2, 3, 4, 5])
+        return scored.astype(int)
+    except (ValueError, IndexError):
+        # Too few distinct values to form quintiles.
+        return pd.Series(3, index=values.index, dtype=int)
+
+
+def _assign_labels(centers_scaled: np.ndarray) -> dict[int, str]:
+    """Rank clusters by their combined RFM score and map them to business labels."""
+    scores = centers_scaled.sum(axis=1)
+    ranking = list(np.argsort(scores)[::-1])  # best first
+
+    assignment: dict[int, str] = {int(ranking[0]): "Champions"}
+    if len(ranking) == 1:
+        return assignment
+
+    assignment[int(ranking[-1])] = "Lost"
+
+    middles = ranking[1:-1]
+    if middles:
+        # The fresher middle cluster is growing; the staler one is at risk.
+        middles = sorted(middles, key=lambda c: centers_scaled[c, 0], reverse=True)
+        for idx, cluster in enumerate(middles):
+            assignment[int(cluster)] = "New / Growing" if idx == 0 else "At-Risk"
+
+    return assignment
+
+
+def run_segmentation(
+    orders_df: pd.DataFrame,
+    customers_df: pd.DataFrame | None = None,
+    top_n: int = 15,
+) -> dict:
+    """
+    Segment customers and return per-segment metrics plus the top customers.
+
+    ``customers_df`` optionally supplies names / account segment / region.
+    """
+    if orders_df.empty or "customer_id" not in orders_df.columns:
+        return {
+            "segments": [],
+            "top_customers": [],
+            "total_customers": 0,
+            "total_revenue": 0.0,
+            "averages": {},
+        }
+
     rfm = compute_rfm(orders_df)
 
-    scaler = StandardScaler()
-    rfm_scaled = scaler.fit_transform(rfm[["recency", "frequency", "monetary"]])
-
-    n_clusters = min(4, len(rfm))  # guard against tiny datasets
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    rfm["cluster"] = kmeans.fit_predict(rfm_scaled)
-
-    # Map clusters to meaningful labels by inspecting centroids
-    centers = pd.DataFrame(
-        scaler.inverse_transform(kmeans.cluster_centers_),
-        columns=["recency", "frequency", "monetary"],
+    features = np.column_stack(
+        [
+            rfm["r_score"].astype(float),
+            rfm["f_score"].astype(float),
+            rfm["m_score"].astype(float),
+        ]
     )
-    # Champion: low recency, high freq, high monetary
-    centers["score"] = -centers["recency"] + centers["frequency"] * 2 + centers["monetary"] / 500
-    sorted_clusters = centers["score"].argsort()[::-1].values  # best first
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(features)
 
-    # Build mapping: original cluster_id → SEGMENT_LABELS key (0=Champions … 3=Lost)
-    label_map = {}
-    for rank, cluster_id in enumerate(sorted_clusters):
-        label_map[int(cluster_id)] = rank % 4  # wrap in case n_clusters < 4
+    n_clusters = int(min(4, max(1, len(rfm))))
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    rfm["cluster"] = kmeans.fit_predict(scaled)
 
-    rfm["segment_id"] = rfm["cluster"].map(label_map)
-    rfm["segment"] = rfm["segment_id"].map(lambda x: SEGMENT_LABELS[x]["name"])
+    centers_scaled = kmeans.cluster_centers_
+    assignment = _assign_labels(centers_scaled)
+    rfm["segment"] = rfm["cluster"].map(assignment)
 
-    # Build segment summary
-    segment_summary = []
-    for sid, info in SEGMENT_LABELS.items():
-        seg_df = rfm[rfm["segment_id"] == sid]
-        segment_summary.append({
-            "id": sid,
-            "name": info["name"],
-            "color": info["color"],
-            "description": info["description"],
-            "count": len(seg_df),
-            "avg_recency":  round(seg_df["recency"].mean(),  1) if len(seg_df) > 0 else 0,
-            "avg_frequency": round(seg_df["frequency"].mean(), 1) if len(seg_df) > 0 else 0,
-            "avg_monetary": round(seg_df["monetary"].mean(),  2) if len(seg_df) > 0 else 0,
-        })
+    # Attach customer attributes.
+    if customers_df is not None and not customers_df.empty:
+        attrs = customers_df.rename(columns={"segment": "account_segment"})
+        keep = [
+            c
+            for c in ["customer_id", "customer_name", "account_segment", "region", "state"]
+            if c in attrs.columns
+        ]
+        rfm = rfm.merge(attrs[keep], on="customer_id", how="left")
+    for column, default in [
+        ("customer_name", None),
+        ("account_segment", "Unknown"),
+        ("region", "Unknown"),
+        ("state", "Unknown"),
+    ]:
+        if column not in rfm.columns:
+            rfm[column] = default
 
-    top_customers = rfm.nlargest(20, "monetary")[
-        ["customer_id", "recency", "frequency", "monetary", "segment"]
-    ].to_dict(orient="records")
+    total_revenue = float(rfm["monetary"].sum())
+
+    # Category / region affinity per customer (revenue-weighted).
+    affinity = orders_df.groupby(["customer_id", "category"])["sales"].sum().reset_index()
+    top_category = (
+        affinity.sort_values("sales", ascending=False)
+        .drop_duplicates("customer_id")
+        .set_index("customer_id")["category"]
+    )
+    rfm["top_category"] = rfm["customer_id"].map(top_category).fillna("Uncategorised")
+
+    segments = []
+    for name in sorted(assignment.values(), key=lambda n: SEGMENT_LABELS[n]["rank"]):
+        group = rfm[rfm["segment"] == name]
+        if group.empty:
+            continue
+        meta = SEGMENT_LABELS[name]
+        revenue = float(group["monetary"].sum())
+        segments.append(
+            {
+                "name": name,
+                "color": meta["color"],
+                "description": meta["description"],
+                "count": int(len(group)),
+                "share": round(len(group) / len(rfm) * 100, 1),
+                "revenue": round(revenue, 2),
+                "revenue_share": round(revenue / total_revenue * 100, 1) if total_revenue else 0.0,
+                "avg_monetary": round(float(group["monetary"].mean()), 2),
+                "avg_frequency": round(float(group["frequency"].mean()), 2),
+                "avg_recency": round(float(group["recency"].mean()), 1),
+                "avg_order_value": round(float(group["avg_order_value"].mean()), 2),
+                "avg_quantity": round(float(group["quantity"].mean()), 1),
+                "avg_discount": round(float(group["avg_discount"].mean()) * 100, 1),
+                "inactive_share": round(float((group["recency"] > 180).mean() * 100), 1),
+                "top_category": (
+                    group["top_category"].mode().iloc[0] if not group["top_category"].mode().empty else "—"
+                ),
+                "top_region": (
+                    group["region"].mode().iloc[0]
+                    if not group["region"].mode().empty
+                    else "—"
+                ),
+            }
+        )
+
+    top_customers = (
+        rfm.sort_values("monetary", ascending=False)
+        .head(top_n)[
+            [
+                "customer_id",
+                "customer_name",
+                "account_segment",
+                "region",
+                "segment",
+                "recency",
+                "frequency",
+                "monetary",
+                "avg_order_value",
+                "top_category",
+            ]
+        ]
+        .to_dict(orient="records")
+    )
 
     return {
-        "segments": segment_summary,
+        "segments": segments,
         "top_customers": top_customers,
-        "total_customers": len(rfm),
+        "total_customers": int(len(rfm)),
+        "total_revenue": round(total_revenue, 2),
+        "averages": {
+            "recency": round(float(rfm["recency"].mean()), 1),
+            "frequency": round(float(rfm["frequency"].mean()), 2),
+            "monetary": round(float(rfm["monetary"].mean()), 2),
+            "order_value": round(float(rfm["avg_order_value"].mean()), 2),
+        },
     }

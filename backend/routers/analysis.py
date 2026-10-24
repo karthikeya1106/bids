@@ -5,11 +5,13 @@ Endpoints:
   GET /api/analysis/report       — Full analysis: KPIs, segmentation, drift, root cause, forecast, AI strategy
   GET /api/analysis/health-score — Single 0-100 org-health score
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
-from db.database import SessionLocal
+from sqlalchemy.orm import Session
+from db.database import get_db
 from db.models import Order, Customer, KPI, DatasetMeta
-from ml.root_cause import detect_anomalies, build_fishbone
+from ml.root_cause import detect_anomalies, build_fishbone, explain_anomaly
+from security import require_user
 
 import pandas as pd
 import numpy as np
@@ -21,8 +23,8 @@ router = APIRouter()
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _get_orders_df(db) -> pd.DataFrame:
-    orders = db.query(Order).all()
+def _get_orders_df(db, owner_id: str) -> pd.DataFrame:
+    orders = db.query(Order).filter(Order.owner_id == owner_id).all()
     if not orders:
         return pd.DataFrame()
     return pd.DataFrame([{
@@ -345,107 +347,105 @@ def _generate_action_items(kpis: dict, segmentation: list, top_root_cause: dict,
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @router.get("/report")
-def get_analysis_report():
+def get_analysis_report(
+    db: Session = Depends(get_db),
+    owner: str = Depends(require_user),
+):
     """
-    Returns the complete deep analysis for the current dataset:
+    Returns the complete deep analysis for this workspace's dataset:
     org identity, health score, KPIs, segmentation, drift series,
     root cause fishbone, 6-month forecast, and priority action items.
     """
-    db = SessionLocal()
-    try:
-        meta = db.query(DatasetMeta).order_by(DatasetMeta.id.desc()).first()
-        df   = _get_orders_df(db)
+    meta = db.query(DatasetMeta).filter(DatasetMeta.owner_id == owner).first()
+    df   = _get_orders_df(db, owner)
 
-        if df.empty:
-            raise HTTPException(status_code=404, detail="No data loaded. Please upload a dataset first.")
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No data loaded. Please upload a dataset first.")
 
-        # ── KPIs ──────────────────────────────────────────────────────────────
-        kpis = _compute_kpis(df)
+    # ── KPIs ──────────────────────────────────────────────────────────────
+    kpis = _compute_kpis(df)
 
-        # ── Segmentation ──────────────────────────────────────────────────────
-        segmentation = _compute_segmentation(df)
+    # ── Segmentation ──────────────────────────────────────────────────────
+    segmentation = _compute_segmentation(df)
 
-        # ── Drift series ──────────────────────────────────────────────────────
-        drift_series = _compute_drift_series(df)
+    # ── Drift series ──────────────────────────────────────────────────────
+    drift_series = _compute_drift_series(df)
 
-        # ── Anomaly detection + root cause ────────────────────────────────────
-        monthly_for_anomaly = pd.DataFrame([
-            {"ds": pd.Timestamp(row["month"]), "y": row["revenue"]}
-            for row in drift_series
-        ])
-        anomalies = detect_anomalies(monthly_for_anomaly) if not monthly_for_anomaly.empty else []
-        anomaly_months = [a["date"] for a in anomalies]
-        fishbone_result = build_fishbone(df, anomaly_months)
+    # ── Anomaly detection + root cause ────────────────────────────────────
+    monthly_for_anomaly = pd.DataFrame([
+        {"month": row["month"], "value": float(row["revenue"])}
+        for row in drift_series
+    ])
+    anomalies = detect_anomalies(monthly_for_anomaly) if len(monthly_for_anomaly) >= 4 else []
+    drops = [a for a in anomalies if a.get("type") == "drop"]
+    worst_anomaly = min(drops, key=lambda a: a.get("gap", 0)) if drops else (anomalies[0] if anomalies else None)
+    selected_month = worst_anomaly["month"] if worst_anomaly else None
+    explanation = explain_anomaly(df, selected_month, expected=worst_anomaly.get("expected") if worst_anomaly else None) if selected_month else None
+    fishbone_result = build_fishbone(df, explanation)
 
-        # ── Forecast ──────────────────────────────────────────────────────────
-        forecast = _compute_forecast(df, horizon=6)
+    # ── Forecast ──────────────────────────────────────────────────────────
+    forecast = _compute_forecast(df, horizon=6)
 
-        # ── Benchmark comparison ───────────────────────────────────────────────
-        benchmarks = _compute_benchmarks(kpis, df)
+    # ── Benchmark comparison ───────────────────────────────────────────────
+    benchmarks = _compute_benchmarks(kpis, df)
 
-        # ── Health score ──────────────────────────────────────────────────────
-        health_score = _compute_health_score(kpis, segmentation, anomalies, df)
+    # ── Health score ──────────────────────────────────────────────────────
+    health_score = _compute_health_score(kpis, segmentation, anomalies, df)
 
-        # ── Priority action items ──────────────────────────────────────────────
-        action_items = _generate_action_items(kpis, segmentation, fishbone_result.get("top_root_cause", {}), health_score)
+    # ── Priority action items ──────────────────────────────────────────────
+    action_items = _generate_action_items(kpis, segmentation, fishbone_result.get("top_root_cause", {}), health_score)
 
-        # ── Org identity ──────────────────────────────────────────────────────
-        org_info = {
-            "org_name":     meta.org_name if meta else None,
-            "dataset_name": meta.dataset_name if meta else "Seeded Dataset",
-            "uploaded_at":  str(meta.uploaded_at) if meta else None,
-            "row_count":    meta.row_count if meta else len(df),
-            "customer_count": meta.customer_count if meta else df["customer_id"].nunique(),
-            "total_sales":  meta.total_sales if meta else round(float(df["sales"].sum()), 2),
-            "date_from":    str(df["order_date"].min().date()) if not df.empty else None,
-            "date_to":      str(df["order_date"].max().date()) if not df.empty else None,
-        }
+    # ── Org identity ──────────────────────────────────────────────────────
+    org_info = {
+        "org_name":     meta.org_name if meta else None,
+        "dataset_name": meta.dataset_name if meta else "Seeded Dataset",
+        "uploaded_at":  str(meta.uploaded_at) if meta else None,
+        "row_count":    meta.row_count if meta else len(df),
+        "customer_count": meta.customer_count if meta else df["customer_id"].nunique(),
+        "total_sales":  meta.total_sales if meta else round(float(df["sales"].sum()), 2),
+        "date_from":    str(df["order_date"].min().date()) if not df.empty else None,
+        "date_to":      str(df["order_date"].max().date()) if not df.empty else None,
+    }
 
-        return {
-            "org":            org_info,
-            "health_score":   health_score,
-            "kpis":           kpis,
-            "segmentation":   segmentation,
-            "drift_series":   drift_series,
-            "anomalies":      anomalies,
-            "root_cause":     fishbone_result,
-            "forecast":       forecast,
-            "benchmarks":     benchmarks,
-            "action_items":   action_items,
-            "generated_at":   datetime.utcnow().isoformat(),
-        }
-    finally:
-        db.close()
+    return {
+        "org":            org_info,
+        "health_score":   health_score,
+        "kpis":           kpis,
+        "segmentation":   segmentation,
+        "drift_series":   drift_series,
+        "anomalies":      anomalies,
+        "root_cause":     fishbone_result,
+        "forecast":       forecast,
+        "benchmarks":     benchmarks,
+        "action_items":   action_items,
+        "generated_at":   datetime.utcnow().isoformat(),
+    }
 
 
 @router.get("/health-score")
-def get_health_score():
-    """Returns a single 0–100 org health score derived from the current dataset."""
-    db = SessionLocal()
-    try:
-        df = _get_orders_df(db)
-        if df.empty:
-            return {"score": 0, "status": "No Data"}
+def get_health_score(db: Session = Depends(get_db), owner: str = Depends(require_user)):
+    """Returns a single 0–100 org health score derived from this workspace's dataset."""
+    df = _get_orders_df(db, owner)
+    if df.empty:
+        return {"score": 0, "status": "No Data"}
 
-        kpis         = _compute_kpis(df)
-        segmentation = _compute_segmentation(df)
-        drift_series = _compute_drift_series(df)
-        monthly_for_anomaly = pd.DataFrame([
-            {"ds": pd.Timestamp(row["month"]), "y": row["revenue"]}
-            for row in drift_series
-        ])
-        anomalies = detect_anomalies(monthly_for_anomaly) if not monthly_for_anomaly.empty else []
-        score     = _compute_health_score(kpis, segmentation, anomalies, df)
+    kpis         = _compute_kpis(df)
+    segmentation = _compute_segmentation(df)
+    drift_series = _compute_drift_series(df)
+    monthly_for_anomaly = pd.DataFrame([
+        {"month": row["month"], "value": float(row["revenue"])}
+        for row in drift_series
+    ])
+    anomalies = detect_anomalies(monthly_for_anomaly) if len(monthly_for_anomaly) >= 4 else []
+    score     = _compute_health_score(kpis, segmentation, anomalies, df)
 
-        if score >= 75:
-            status = "Excellent"
-        elif score >= 55:
-            status = "Good"
-        elif score >= 35:
-            status = "Warning"
-        else:
-            status = "Critical"
+    if score >= 75:
+        status = "Excellent"
+    elif score >= 55:
+        status = "Good"
+    elif score >= 35:
+        status = "Warning"
+    else:
+        status = "Critical"
 
-        return {"score": score, "status": status}
-    finally:
-        db.close()
+    return {"score": score, "status": status}

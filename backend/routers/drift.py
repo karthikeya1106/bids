@@ -1,11 +1,23 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from db.database import get_db
-from db.models import KPI, BPRRule, Order
-from ml.drift_detector import analyze_kpi_drift
-import pandas as pd
+"""
+Data Drift & BPR API.
+
+Combines ADWIN change points, PSI distribution shift, feature-mix drift and a
+measured evaluation of each Business Process Rule.
+"""
+from datetime import datetime
 from typing import Optional
+
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from db.database import get_db
+from db.models import BPRRule, KPI
+from ml.drift_detector import analyze_feature_drift, analyze_kpi_drift, evaluate_bpr_rules
+from security import require_user
+from seed_bpr import ensure_bpr_rules
+from services.analytics import load_orders_df, monthly_frame, recalculate_kpis
 
 router = APIRouter()
 
@@ -17,57 +29,127 @@ class RuleUpdateRequest(BaseModel):
 
 
 @router.get("")
-def get_drift(db: Session = Depends(get_db)):
-    orders = db.query(Order).all()
-    kpis = db.query(KPI).all()
-    rules = db.query(BPRRule).all()
+def get_drift(db: Session = Depends(get_db), owner: str = Depends(require_user)):
+    df = load_orders_df(db, owner, with_customer=True)
+
+    kpis = db.query(KPI).filter(KPI.owner_id == owner).all()
+    if not df.empty:
+        ensure_bpr_rules(db, owner)
+    rules = [
+        {
+            "id": rule.id,
+            "rule_name": rule.rule_name,
+            "rule_description": rule.rule_description,
+            "condition_expression": rule.condition_expression,
+            "action": rule.action,
+            "status": rule.status,
+            "effectiveness_score": rule.effectiveness_score,
+            "category": rule.category,
+            "last_triggered": str(rule.last_triggered) if rule.last_triggered else None,
+        }
+        for rule in db.query(BPRRule).filter(BPRRule.owner_id == owner).order_by(BPRRule.id).all()
+    ]
+
+    if df.empty:
+        return {
+            "has_data": False,
+            "kpis": [],
+            "drift_analysis": [],
+            "feature_drift": [],
+            "bpr_rules": rules,
+            "summary": None,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+
+    monthly = monthly_frame(df)
+    drift_analysis = analyze_kpi_drift(monthly)
+    feature_drift = analyze_feature_drift(df)
+    evaluated_rules = evaluate_bpr_rules(rules, df)
 
     kpi_list = [
         {
-            "kpi_name": k.kpi_name, "current_value": k.current_value,
-            "baseline_value": k.baseline_value, "target_value": k.target_value,
-            "drift_score": k.drift_score, "unit": k.unit,
+            "kpi_name": kpi.kpi_name,
+            "current_value": kpi.current_value,
+            "baseline_value": kpi.baseline_value,
+            "target_value": kpi.target_value,
+            "drift_score": kpi.drift_score,
+            "unit": kpi.unit,
+            "gap_pct": round((kpi.current_value - kpi.target_value) / abs(kpi.target_value) * 100, 1)
+            if kpi.target_value
+            else None,
+            "on_target": (
+                kpi.current_value >= kpi.target_value
+                if kpi.kpi_name != "Churn Rate"
+                else kpi.current_value <= kpi.target_value
+            ),
+            "last_updated": str(kpi.last_updated) if kpi.last_updated else None,
         }
-        for k in kpis
+        for kpi in kpis
     ]
 
-    rules_list = [
-        {
-            "id": r.id, "rule_name": r.rule_name, "rule_description": r.rule_description,
-            "condition_expression": r.condition_expression, "action": r.action,
-            "status": r.status, "effectiveness_score": r.effectiveness_score, "category": r.category,
-        }
-        for r in rules
+    status_counts = {"shifted": 0, "watch": 0, "stable": 0}
+    for entry in drift_analysis:
+        status_counts[entry["status"]] = status_counts.get(entry["status"], 0) + 1
+
+    shifted_features = [f for f in feature_drift if f["status"] == "significant"]
+    measured = [rule for rule in evaluated_rules if rule.get("effectiveness_score") is not None]
+    triggered_recently = [
+        rule
+        for rule in evaluated_rules
+        if rule.get("evaluation", {}).get("current_triggered")
     ]
 
-    drift_analysis = []
-    if orders:
-        df = pd.DataFrame([{"order_date": pd.to_datetime(o.order_date), "sales": o.sales,
-                             "profit": o.profit, "order_id": o.order_id} for o in orders])
-        df["month"] = df["order_date"].dt.to_period("M")
-        monthly = df.groupby("month").agg(
-            sales=("sales", "sum"), profit=("profit", "sum"), orders=("order_id", "nunique")
-        ).reset_index()
-        monthly["ds"] = monthly["month"].dt.to_timestamp()
-        drift_analysis = analyze_kpi_drift(monthly)
+    summary = {
+        "kpis_monitored": len(drift_analysis),
+        "shifted": status_counts.get("shifted", 0),
+        "watching": status_counts.get("watch", 0),
+        "stable": status_counts.get("stable", 0),
+        "features_tracked": len(feature_drift),
+        "features_shifted": len(shifted_features),
+        "rules_total": len(evaluated_rules),
+        "rules_active": sum(1 for rule in evaluated_rules if rule["status"] == "active"),
+        "rules_needing_review": sum(1 for rule in evaluated_rules if rule["status"] == "needs_review"),
+        "rules_obsolete": sum(1 for rule in evaluated_rules if rule["status"] == "obsolete"),
+        "rules_measurable": len(measured),
+        "average_effectiveness": round(
+            sum(rule["effectiveness_score"] for rule in measured) / len(measured), 2
+        ) if measured else None,
+        "rules_triggering_now": len(triggered_recently),
+        "period_from": monthly["month"].iloc[0] if not monthly.empty else None,
+        "period_to": monthly["month"].iloc[-1] if not monthly.empty else None,
+    }
 
     return {
+        "has_data": True,
         "kpis": kpi_list,
-        "bpr_rules": rules_list,
         "drift_analysis": drift_analysis,
-        "active_rules": sum(1 for r in rules if r.status == "active"),
-        "rules_needing_review": sum(1 for r in rules if r.status == "needs_review"),
-        "obsolete_rules": sum(1 for r in rules if r.status == "obsolete"),
+        "feature_drift": feature_drift,
+        "bpr_rules": evaluated_rules,
+        "summary": summary,
+        "generated_at": datetime.utcnow().isoformat(),
     }
 
 
 @router.patch("/rules/{rule_id}")
-def update_rule(rule_id: int, body: RuleUpdateRequest, db: Session = Depends(get_db)):
-    rule = db.query(BPRRule).filter(BPRRule.id == rule_id).first()
+def update_rule(
+    rule_id: int,
+    body: RuleUpdateRequest,
+    db: Session = Depends(get_db),
+    owner: str = Depends(require_user),
+):
+    rule = (
+        db.query(BPRRule)
+        .filter(BPRRule.id == rule_id, BPRRule.owner_id == owner)
+        .first()
+    )
     if not rule:
+        # Same response for "missing" and "belongs to someone else" so rule ids
+        # cannot be probed across workspaces.
         raise HTTPException(status_code=404, detail="Rule not found")
 
     if body.status:
+        if body.status not in {"active", "needs_review", "obsolete"}:
+            raise HTTPException(status_code=422, detail="status must be active, needs_review or obsolete")
         rule.status = body.status
     if body.rule_description:
         rule.rule_description = body.rule_description
@@ -77,3 +159,13 @@ def update_rule(rule_id: int, body: RuleUpdateRequest, db: Session = Depends(get
     db.commit()
     db.refresh(rule)
     return {"message": "Rule updated", "rule_id": rule_id, "new_status": rule.status}
+
+
+@router.post("/recalculate")
+def recalculate(db: Session = Depends(get_db), owner: str = Depends(require_user)):
+    """Recompute the KPI table from the loaded orders (used after a data upload)."""
+    df = load_orders_df(db, owner)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="No dataset loaded")
+    recalculate_kpis(db, owner)
+    return {"message": "KPIs recalculated", "orders": int(len(df))}

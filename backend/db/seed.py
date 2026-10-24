@@ -1,84 +1,118 @@
 """
-Seed script: loads Kaggle Superstore dataset CSV into PostgreSQL.
-Place the 'Sample - Superstore.csv' file in backend/data/ before running.
-Run: python -m db.seed
+Seed one workspace with data.
+
+Loads ``backend/data/Sample - Superstore.csv`` when present, otherwise falls
+back to synthetic demo data. Everything is written under the ``--owner`` email,
+so seeding never creates data that another account can see.
+
+Run from the backend directory:
+    python -m db.seed --owner demo@example.com
 """
-import pandas as pd
-import sys
+from __future__ import annotations
+
+import argparse
 import os
-from datetime import datetime, date
+import random
+import sys
+from datetime import date, timedelta
+
+import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from db.database import engine, SessionLocal, Base
-from db.models import Customer, Order, KPI, BPRRule
+from db.database import Base, SessionLocal, engine
+from db.models import Customer, DatasetMeta, Order
+from seed_bpr import ensure_bpr_rules
+from services.analytics import recalculate_kpis
+
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CSV_PATH = os.path.join(BACKEND_DIR, "data", "Sample - Superstore.csv")
 
 
-def seed():
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
+def _clear(db, owner_id: str) -> None:
+    db.query(Order).filter(Order.owner_id == owner_id).delete()
+    db.query(Customer).filter(Customer.owner_id == owner_id).delete()
+    db.query(DatasetMeta).filter(DatasetMeta.owner_id == owner_id).delete()
+    db.commit()
 
-    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "Sample - Superstore.csv")
-    if not os.path.exists(csv_path):
-        print("[INFO] Superstore CSV not found. Seeding mock data instead...")
-        seed_mock_data(db)
-        db.close()
-        seed_kpis_and_rules()
-        return
 
-    try:
-        df = pd.read_csv(csv_path, encoding="latin-1")
-        df.columns = [c.strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
+def _load_superstore(db, owner_id: str) -> dict:
+    df = pd.read_csv(CSV_PATH, encoding="latin-1")
+    df.columns = [c.strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
 
-        # --- Customers ---
-        db.query(Customer).delete()
-        customers = df[["customer_id", "customer_name", "segment", "region", "city", "state", "country"]].drop_duplicates("customer_id")
-        for _, row in customers.iterrows():
-            db.add(Customer(
-                customer_id=row["customer_id"],
-                customer_name=row["customer_name"],
-                segment=row["segment"],
-                region=row["region"],
-                city=row["city"],
-                state=row.get("state", ""),
-                country=row.get("country", "United States"),
-            ))
+    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+    df["ship_date"] = pd.to_datetime(df["ship_date"], errors="coerce")
+    df = df.dropna(subset=["order_date", "customer_id", "order_id", "sales"])
 
-        # --- Orders ---
-        db.query(Order).delete()
-        for _, row in df.iterrows():
-            db.add(Order(
-                order_id=row["order_id"],
-                order_date=pd.to_datetime(row["order_date"]).date(),
-                ship_date=pd.to_datetime(row["ship_date"]).date(),
-                customer_id=row["customer_id"],
-                category=row["category"],
-                sub_category=row["sub_category"],
-                product_name=row["product_name"],
+    customers = df.drop_duplicates("customer_id")
+    db.add_all(
+        [
+            Customer(
+                owner_id=owner_id,
+                customer_id=str(row["customer_id"]),
+                customer_name=str(row.get("customer_name") or row["customer_id"]),
+                segment=str(row.get("segment") or "Unknown"),
+                region=str(row.get("region") or "Unknown"),
+                city=str(row.get("city") or "Unknown"),
+                state=str(row.get("state") or "Unknown"),
+                country=str(row.get("country") or "Unknown"),
+            )
+            for _, row in customers.iterrows()
+        ]
+    )
+    db.commit()
+
+    batch: list[Order] = []
+    for _, row in df.iterrows():
+        ship_date = row["ship_date"]
+        batch.append(
+            Order(
+                owner_id=owner_id,
+                order_id=str(row["order_id"]),
+                order_date=row["order_date"].date(),
+                ship_date=ship_date.date() if pd.notna(ship_date) else row["order_date"].date(),
+                customer_id=str(row["customer_id"]),
+                category=str(row.get("category") or "General"),
+                sub_category=str(row.get("sub_category") or "General"),
+                product_name=str(row.get("product_name") or "Unknown product"),
                 sales=float(row["sales"]),
-                quantity=int(row["quantity"]),
-                discount=float(row["discount"]),
-                profit=float(row["profit"]),
-            ))
-
+                quantity=int(row.get("quantity") or 1),
+                discount=float(row.get("discount") or 0),
+                profit=float(row["profit"]) if pd.notna(row.get("profit")) else 0.0,
+            )
+        )
+        if len(batch) >= 1000:
+            db.add_all(batch)
+            db.commit()
+            batch = []
+    if batch:
+        db.add_all(batch)
         db.commit()
-        print(f"[OK] Seeded {len(customers)} customers and {len(df)} orders from CSV")
 
-    except Exception as e:
-        db.rollback()
-        print(f"[ERROR] Error seeding from CSV: {e}")
-        print("Falling back to mock data...")
-        seed_mock_data(db)
-    finally:
-        db.close()
-        seed_kpis_and_rules()
+    total_sales = float(df["sales"].sum())
+    db.add(
+        DatasetMeta(
+            owner_id=owner_id,
+            dataset_name=os.path.basename(CSV_PATH),
+            org_name=None,
+            source="seed",
+            row_count=int(len(df)),
+            customer_count=int(customers["customer_id"].nunique()),
+            total_sales=round(total_sales, 2),
+        )
+    )
+    db.commit()
+
+    return {
+        "dataset": os.path.basename(CSV_PATH),
+        "orders": int(len(df)),
+        "customers": int(customers["customer_id"].nunique()),
+        "total_sales": round(total_sales, 2),
+    }
 
 
-def seed_mock_data(db):
-    """Generate synthetic Superstore-like data if CSV is missing."""
-    import random
-    from datetime import timedelta
-
+def _seed_mock(db, owner_id: str) -> dict:
+    """Synthetic fallback used only when the CSV is missing."""
     categories = [
         ("Furniture", ["Chairs", "Tables", "Bookcases", "Furnishings"]),
         ("Technology", ["Phones", "Accessories", "Machines", "Copiers"]),
@@ -88,23 +122,24 @@ def seed_mock_data(db):
     segments = ["Consumer", "Corporate", "Home Office"]
     states = ["California", "New York", "Texas", "Florida", "Illinois", "Washington", "Ohio"]
 
-    db.query(Customer).delete()
-    db.query(Order).delete()
-
     base_date = date(2021, 1, 1)
-    all_customers = []
+    customer_ids = []
     for i in range(800):
-        cid = f"CUST-{1000+i}"
-        all_customers.append(Customer(
-            customer_id=cid,
-            customer_name=f"Customer {i+1}",
-            segment=random.choice(segments),
-            region=random.choice(regions),
-            city="Springfield",
-            state=random.choice(states),
-            country="United States",
-        ))
-    db.add_all(all_customers)
+        cid = f"CUST-{1000 + i}"
+        customer_ids.append(cid)
+        db.add(
+            Customer(
+                owner_id=owner_id,
+                customer_id=cid,
+                customer_name=f"Customer {i + 1}",
+                segment=random.choice(segments),
+                region=random.choice(regions),
+                city="Springfield",
+                state=random.choice(states),
+                country="United States",
+            )
+        )
+    db.commit()
 
     for i in range(9000):
         days_offset = random.randint(0, 1460)
@@ -112,62 +147,78 @@ def seed_mock_data(db):
         cat, subs = random.choice(categories)
         sub = random.choice(subs)
         qty = random.randint(1, 10)
-        base_price = random.uniform(10, 1200)
         discount = random.choice([0, 0.1, 0.2, 0.3, 0.4])
-        sales = round(base_price * qty * (1 - discount), 2)
-        profit = round(sales * random.uniform(-0.3, 0.45), 2)
-
-        db.add(Order(
-            order_id=f"ORD-{2021+days_offset//365}-{10000+i}",
-            order_date=order_date,
-            ship_date=order_date + timedelta(days=random.randint(2, 7)),
-            customer_id=all_customers[random.randint(0, 799)].customer_id,
-            category=cat,
-            sub_category=sub,
-            product_name=f"{sub} Product {random.randint(1,50)}",
-            sales=sales,
-            quantity=qty,
-            discount=discount,
-            profit=profit,
-        ))
-
+        sales = round(random.uniform(10, 1200) * qty * (1 - discount), 2)
+        db.add(
+            Order(
+                owner_id=owner_id,
+                order_id=f"ORD-{2021 + days_offset // 365}-{10000 + i}",
+                order_date=order_date,
+                ship_date=order_date + timedelta(days=random.randint(2, 7)),
+                customer_id=random.choice(customer_ids),
+                category=cat,
+                sub_category=sub,
+                product_name=f"{sub} Product {random.randint(1, 50)}",
+                sales=sales,
+                quantity=qty,
+                discount=discount,
+                profit=round(sales * random.uniform(-0.3, 0.45), 2),
+            )
+        )
     db.commit()
-    print("[OK] Mock data seeded: 800 customers, 9000 orders")
+
+    total = sum(row[0] for row in db.query(Order.sales).filter(Order.owner_id == owner_id).all())
+    db.add(
+        DatasetMeta(
+            owner_id=owner_id,
+            dataset_name="Synthetic demo dataset",
+            org_name=None,
+            source="seed",
+            row_count=9000,
+            customer_count=800,
+            total_sales=round(total, 2),
+        )
+    )
+    db.commit()
+
+    return {
+        "dataset": "Synthetic demo dataset",
+        "orders": 9000,
+        "customers": 800,
+        "total_sales": round(total, 2),
+    }
 
 
-def seed_kpis_and_rules():
+def seed(owner_id: str) -> None:
+    owner_id = owner_id.strip().lower()
+    Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        # KPIs
-        db.query(KPI).delete()
-        kpis = [
-            KPI(kpi_name="Total Revenue", current_value=2297201, baseline_value=2100000, target_value=2500000, drift_score=0.12, unit="USD"),
-            KPI(kpi_name="Avg Order Value", current_value=458, baseline_value=430, target_value=500, drift_score=0.08, unit="USD"),
-            KPI(kpi_name="Customer Retention Rate", current_value=67.4, baseline_value=72.0, target_value=75.0, drift_score=0.31, unit="%"),
-            KPI(kpi_name="Profit Margin", current_value=12.5, baseline_value=15.0, target_value=18.0, drift_score=0.42, unit="%"),
-            KPI(kpi_name="Churn Rate", current_value=18.2, baseline_value=14.0, target_value=10.0, drift_score=0.55, unit="%"),
-            KPI(kpi_name="New Customer Acquisition", current_value=312, baseline_value=280, target_value=350, drift_score=0.06, unit="count"),
-            KPI(kpi_name="Repeat Purchase Rate", current_value=43.1, baseline_value=48.0, target_value=55.0, drift_score=0.37, unit="%"),
-        ]
-        db.add_all(kpis)
+        _clear(db, owner_id)
+        if os.path.exists(CSV_PATH):
+            summary = _load_superstore(db, owner_id)
+        else:
+            print("[INFO] Superstore CSV not found — seeding synthetic data instead.")
+            summary = _seed_mock(db, owner_id)
 
-        # BPR Rules
-        db.query(BPRRule).delete()
-        rules = [
-            BPRRule(rule_name="Loyalty Discount Trigger", rule_description="Apply 15% discount when customer makes 5+ purchases in a quarter", condition_expression="purchase_count_90d >= 5", action="Apply 15% loyalty discount on next order", status="active", effectiveness_score=0.88, category="Retention"),
-            BPRRule(rule_name="High-Value Upsell Prompt", rule_description="Trigger upsell recommendation when cart value exceeds $500", condition_expression="cart_value > 500", action="Show premium product bundle recommendation", status="active", effectiveness_score=0.74, category="Revenue"),
-            BPRRule(rule_name="Churn Prevention Alert", rule_description="Flag customer for re-engagement if no purchase in 90 days", condition_expression="days_since_last_purchase >= 90", action="Send personalized re-engagement email campaign", status="needs_review", effectiveness_score=0.51, category="Retention"),
-            BPRRule(rule_name="Bulk Order B2B Discount", rule_description="Apply 20% discount on orders with quantity > 20 for Corporate segment", condition_expression="quantity > 20 AND segment == 'Corporate'", action="Apply 20% bulk discount automatically", status="active", effectiveness_score=0.91, category="Pricing"),
-            BPRRule(rule_name="Seasonal Markdown Policy", rule_description="Reduce Furniture prices by 25% in Q4 to clear inventory", condition_expression="quarter == 4 AND category == 'Furniture'", action="Apply 25% markdown to all Furniture SKUs", status="needs_review", effectiveness_score=0.43, category="Pricing"),
-            BPRRule(rule_name="Low-Margin SKU Freeze", rule_description="Pause promotions on any SKU with profit margin below 5%", condition_expression="profit_margin < 0.05", action="Remove SKU from active campaign lists", status="obsolete", effectiveness_score=0.22, category="Operations"),
-            BPRRule(rule_name="Regional Inventory Reorder", rule_description="Trigger restock when regional stock falls below 30 units", condition_expression="regional_stock < 30", action="Auto-generate purchase order for 100 units", status="active", effectiveness_score=0.95, category="Operations"),
-        ]
-        db.add_all(rules)
-        db.commit()
-        print("[OK] KPIs and BPR Rules seeded")
+        rules = ensure_bpr_rules(db, owner_id)
+        recalculate_kpis(db, owner_id)
+
+        print(
+            f"[OK] Seeded {summary['orders']:,} orders for {summary['customers']:,} customers "
+            f"({summary['dataset']}) into {owner_id} — ${summary['total_sales']:,.2f} revenue, "
+            f"{rules} BPR rules."
+        )
+    except Exception as exc:
+        db.rollback()
+        print(f"[ERROR] Seeding failed: {exc}")
+        raise
     finally:
         db.close()
 
 
 if __name__ == "__main__":
-    seed()
+    parser = argparse.ArgumentParser(description="Load sample data into one workspace.")
+    parser.add_argument("--owner", required=True, help="Account email that will own the data")
+    args = parser.parse_args()
+    seed(args.owner)

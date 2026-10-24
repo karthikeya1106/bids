@@ -2,11 +2,12 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  LayoutDashboard, PieChart, AlertTriangle,
+  Home, LayoutDashboard, PieChart, AlertTriangle,
   Activity, TrendingUp, BarChart3, Zap, Upload, FileBarChart2,
 } from "lucide-react";
 
 const navItems = [
+  { href: "/home",         label: "Home Launchpad",       icon: Home,            section: "Navigation" },
   { href: "/dashboard",    label: "Executive Dashboard",  icon: LayoutDashboard, section: "Modules" },
   { href: "/behavior",     label: "Behavior Analytics",   icon: Activity,        section: "Modules" },
   { href: "/segmentation", label: "Customer Segments",    icon: PieChart,        section: "Modules" },
@@ -24,7 +25,7 @@ export default function Sidebar() {
   return (
     <aside className="sidebar">
       {/* Logo */}
-      <div className="sidebar-logo">
+      <Link href="/home" className="sidebar-logo" style={{ textDecoration: "none" }}>
         <div className="sidebar-logo-icon">
           <Zap size={18} color="#ffffff" strokeWidth={2.5} />
         </div>
@@ -32,7 +33,7 @@ export default function Sidebar() {
           <div className="sidebar-logo-title">BIDS</div>
           <div className="sidebar-logo-sub">Intelligence Platform</div>
         </div>
-      </div>
+      </Link>
 
       {/* Navigation */}
       <nav className="sidebar-nav">

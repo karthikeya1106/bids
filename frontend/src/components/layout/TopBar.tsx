@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useSession, signOut } from "next-auth/react";
 
 const PAGE_LABELS: Record<string, string> = {
+  "/home":         "Home · Module Launchpad",
   "/dashboard":    "Executive Dashboard",
   "/behavior":     "Behavior Analytics",
   "/segmentation": "Customer Segments",

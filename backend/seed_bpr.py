@@ -1,11 +1,15 @@
 """
-Seed script: insert 6 realistic BPR (Business Process Rule) entries
-into the bpr_rules table.
+Business Process Rule templates.
+
+Rules are provisioned per workspace (never globally) when a user loads data.
+The template carries the logic only; effectiveness and trigger history are
+measured from that workspace's own orders at read time.
 
 Usage:
     cd psone/backend
-    python seed_bpr.py
+    python seed_bpr.py --owner you@example.com
 """
+import argparse
 import sys
 import os
 import io
@@ -85,34 +89,41 @@ RULES = [
 ]
 
 
-def seed():
-    # Ensure tables exist before seeding
-    Base.metadata.create_all(bind=engine)
+def ensure_bpr_rules(db, owner_id: str) -> int:
+    """Create this workspace's rule set if it does not exist yet."""
+    existing = db.query(BPRRule).filter(BPRRule.owner_id == owner_id).count()
+    if existing:
+        return existing
 
-    db = SessionLocal()
-    try:
-        existing = db.query(BPRRule).count()
-        if existing >= len(RULES):
-            print(f"[OK] BPR rules already seeded ({existing} records found). Skipping.")
-            return
-
-        added = 0
-        for rule_data in RULES:
-            exists = db.query(BPRRule).filter(BPRRule.rule_name == rule_data["rule_name"]).first()
-            if not exists:
-                rule = BPRRule(**rule_data)
-                db.add(rule)
-                added += 1
-
-        db.commit()
-        print(f"[OK] Seeded {added} BPR rules successfully.")
-    except Exception as e:
-        db.rollback()
-        print(f"[ERROR] Error seeding BPR rules: {e}")
-        raise
-    finally:
-        db.close()
+    db.add_all(
+        [
+            BPRRule(
+                owner_id=owner_id,
+                rule_name=rule["rule_name"],
+                rule_description=rule["rule_description"],
+                condition_expression=rule["condition_expression"],
+                action=rule["action"],
+                status="active",
+                effectiveness_score=None,
+                last_triggered=None,
+                category=rule["category"],
+            )
+            for rule in RULES
+        ]
+    )
+    db.commit()
+    return db.query(BPRRule).filter(BPRRule.owner_id == owner_id).count()
 
 
 if __name__ == "__main__":
-    seed()
+    parser = argparse.ArgumentParser(description="Provision BPR rules for one workspace.")
+    parser.add_argument("--owner", required=True, help="Account email that owns the rules")
+    args = parser.parse_args()
+
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        total = ensure_bpr_rules(db, args.owner.strip().lower())
+        print(f"[OK] {total} BPR rules available for {args.owner.strip().lower()}.")
+    finally:
+        db.close()

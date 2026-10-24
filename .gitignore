@@ -38,3 +38,6 @@ frontend/.env.local
 .DS_Store
 Thumbs.db
 *.pem
+
+# One-off legacy demo database backup created by the tenant migration
+*.legacy-demo-backup

@@ -1,44 +1,118 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from db.database import get_db
-from db.models import Order
-from ml.root_cause import detect_anomalies, build_fishbone
+"""
+Root Cause Analysis API.
+
+Returns the monthly revenue series, statistically flagged anomaly months, and —
+for the selected month — a full driver decomposition plus the Ishikawa fishbone.
+"""
+from datetime import datetime
+
 import pandas as pd
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from db.database import get_db
+from ml.root_cause import build_fishbone, detect_anomalies, explain_anomaly, seasonal_baseline
+from security import require_user
+from services.analytics import load_orders_df, monthly_frame, money
 
 router = APIRouter()
 
 
 @router.get("")
-def get_rootcause(db: Session = Depends(get_db)):
-    orders = db.query(Order).all()
-    if not orders:
-        return _mock_rootcause()
+def get_rootcause(
+    month: str | None = Query(None, description="YYYY-MM anomaly month to explain"),
+    db: Session = Depends(get_db),
+    owner: str = Depends(require_user),
+):
+    df = load_orders_df(db, owner, with_customer=True)
+    if df.empty:
+        return {
+            "has_data": False,
+            "monthly_series": [],
+            "anomalies": [],
+            "selected": None,
+            "fishbone": {},
+            "top_root_cause": None,
+            "summary": None,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
 
-    df = pd.DataFrame([{"order_date": pd.to_datetime(o.order_date), "sales": o.sales} for o in orders])
-    df["month"] = df["order_date"].dt.to_period("M")
-    monthly = df.groupby("month")["sales"].sum().reset_index()
-    monthly["ds"] = monthly["month"].dt.to_timestamp()
-    monthly.rename(columns={"sales": "y"}, inplace=True)
-    monthly = monthly.sort_values("ds").reset_index(drop=True)
+    monthly = monthly_frame(df)
+    series_frame = pd.DataFrame(
+        {
+            "month": monthly["month"],
+            "value": monthly["sales"].astype(float),
+        }
+    )
+    anomalies = detect_anomalies(series_frame)
 
-    anomalies = detect_anomalies(monthly)
-    anomaly_months = [a["date"] for a in anomalies]
-    fishbone = build_fishbone(df, anomaly_months)
+    # Seasonally adjusted expectation for every month, so the chart can show the
+    # normal band even in months that were not flagged.
+    baseline = seasonal_baseline(series_frame)
+    expected = [round(float(value), 2) for value in baseline["expected"]]
+    seasonal = [round(float(value), 2) for value in baseline["seasonal_index"]]
 
-    return {
-        "monthly_series": [{"date": str(r["ds"])[:7], "value": round(r["y"], 2)} for _, r in monthly.iterrows()],
-        "anomalies": anomalies,
-        **fishbone,
+    monthly_series = [
+        {
+            "month": str(row.month),
+            "sales": money(row.sales),
+            "profit": money(row.profit),
+            "orders": int(row.orders),
+            "margin": round(float(row.margin), 2),
+            "expected": expected[index],
+            "seasonal_index": seasonal[index],
+        }
+        for index, row in enumerate(monthly.itertuples(index=False))
+    ]
+
+    # Default to the most damaging drop, else the largest absolute movement.
+    drops = [a for a in anomalies if a["type"] == "drop"]
+    default_month = min(drops, key=lambda a: a["gap"])["month"] if drops else (
+        max(anomalies, key=lambda a: abs(a["gap"]))["month"] if anomalies else None
+    )
+    selected_month = month or default_month
+    if selected_month and selected_month not in {a["month"] for a in anomalies}:
+        selected_month = default_month
+
+    selected_anomaly = next((a for a in anomalies if a["month"] == selected_month), None)
+    explanation = (
+        explain_anomaly(
+            df,
+            selected_month,
+            expected=selected_anomaly["expected"] if selected_anomaly else None,
+        )
+        if selected_month
+        else None
+    )
+    if explanation is not None:
+        explanation["type"] = selected_anomaly["type"] if selected_anomaly else "normal"
+        explanation["severity"] = selected_anomaly["severity"] if selected_anomaly else "low"
+        explanation["z_score"] = selected_anomaly["z_score"] if selected_anomaly else 0.0
+        explanation["expected"] = selected_anomaly["expected"] if selected_anomaly else explanation["revenue"]["baseline"]
+
+    fishbone = build_fishbone(df, explanation)
+
+    drops = [a for a in anomalies if a["type"] == "drop"]
+    spikes = [a for a in anomalies if a["type"] == "spike"]
+    summary = {
+        "months_monitored": int(len(monthly)),
+        "anomaly_count": len(anomalies),
+        "drops": len(drops),
+        "spikes": len(spikes),
+        "worst": min(drops, key=lambda a: a["gap"]) if drops else None,
+        "largest_swing": round(max((abs(a["gap"]) for a in anomalies), default=0.0), 2),
+        "net_swing": round(sum(a["gap"] for a in anomalies), 2),
+        "period_from": monthly_series[0]["month"] if monthly_series else None,
+        "period_to": monthly_series[-1]["month"] if monthly_series else None,
     }
 
-
-def _mock_rootcause():
     return {
-        "monthly_series": [], "anomalies": [],
-        "fishbone": {
-            "People": [{"factor": "No data", "confidence": 0, "evidence": "Seed database to view analysis"}],
-            "Process": [], "Product": [], "External": [],
-        },
-        "top_root_cause": {"branch": "N/A", "factor": "No data", "confidence": 0, "evidence": ""},
-        "anomaly_months": [],
+        "has_data": True,
+        "monthly_series": monthly_series,
+        "anomalies": anomalies,
+        "selected": explanation,
+        "fishbone": fishbone["fishbone"],
+        "top_root_cause": fishbone["top_root_cause"],
+        "summary": summary,
+        "generated_at": datetime.utcnow().isoformat(),
     }
