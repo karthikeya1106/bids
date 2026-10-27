@@ -10,7 +10,9 @@ of history, and the winner (lowest holdout MAPE) is refit on the full series:
 
 The reported accuracy is the holdout MAPE, not an in-sample fit statistic. The
 what-if simulator uses a price elasticity estimated from the order lines, so the
-revenue response is calibrated to the actual data rather than a fixed guess.
+revenue response is calibrated to the actual data rather than a fixed guess — and
+when that fit is unusable it falls back to a prior that the response labels as
+assumed, with the reason, sample size and a band for sensitivity.
 """
 from __future__ import annotations
 
@@ -193,38 +195,91 @@ def _backtest(df: pd.DataFrame, horizon: int) -> tuple[Optional[str], List[Dict]
     }
 
 
+ELASTICITY_PRIOR = -1.2
+ELASTICITY_PRIOR_BAND = (-2.0, -0.6)
+ELASTICITY_MIN_LINES = 60
+
+
+def _assumed_elasticity(reason: str, sample: int = 0, r2: Optional[float] = None) -> Dict:
+    """The prior, explicitly labelled: the simulator is not calibrated then."""
+    return {
+        "value": ELASTICITY_PRIOR,
+        "measured": False,
+        "method": "prior",
+        "reason": reason,
+        "sample": int(sample),
+        "r2": round(float(r2), 3) if r2 is not None else None,
+        "stderr": None,
+        "band": list(ELASTICITY_PRIOR_BAND),
+    }
+
+
 def _elasticity(df: pd.DataFrame) -> Dict:
     """
     Estimate price elasticity from order lines: log(quantity) ~ log(unit price).
 
-    Falls back to a category-agnostic prior when the regression is unusable
-    (fewer than 60 usable lines or a non-negative slope).
+    The caller must be able to tell a fitted coefficient from the fallback prior,
+    because every what-if number is scaled by it. So the result always carries
+    ``measured``, the reason for any fallback, the number of order lines used,
+    the fit quality and a confidence band (slope ± 1.96 standard errors when
+    measured, the documented prior range otherwise).
+
+    Falls back to the prior when the regression is unusable: fewer than
+    ``ELASTICITY_MIN_LINES`` usable lines, or a flat/positive slope (which would
+    imply raising price never loses volume — not credible demand behaviour).
     """
     if df.empty or not {"sales", "quantity"}.issubset(df.columns):
-        return {"value": -1.2, "method": "prior (no order lines)", "sample": 0, "r2": None}
+        return _assumed_elasticity("the dataset has no order lines to fit")
 
     work = df[(df["sales"] > 0) & (df["quantity"] > 0)].copy()
     work["unit_price"] = work["sales"] / work["quantity"]
     work = work[(work["unit_price"] > 0.01) & work["unit_price"].notna()]
-    if len(work) < 60:
-        return {"value": -1.2, "method": "prior (too few lines)", "sample": int(len(work)), "r2": None}
+    if len(work) < ELASTICITY_MIN_LINES:
+        return _assumed_elasticity(
+            f"only {len(work)} usable order lines (need {ELASTICITY_MIN_LINES} to fit)",
+            sample=len(work),
+        )
 
     x = np.log(work["unit_price"].to_numpy(dtype=float))
     y = np.log(work["quantity"].to_numpy(dtype=float))
     slope, intercept = np.polyfit(x, y, 1)
     predicted = slope * x + intercept
-    ss_res = float(np.sum((y - predicted) ** 2))
+    residuals = y - predicted
+    ss_res = float(np.sum(residuals ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2 = 1 - ss_res / ss_tot if ss_tot else None
 
     if not np.isfinite(slope) or slope >= -0.05:
-        return {"value": -1.2, "method": "prior (regression unusable)", "sample": int(len(work)), "r2": round(r2, 3) if r2 else None}
+        return _assumed_elasticity(
+            "the fitted slope was flat or positive, so price response cannot be identified",
+            sample=len(work),
+            r2=r2,
+        )
+
+    clipped = float(np.clip(slope, -4.0, -0.1))
+    # Standard error of the slope; the band is what the sensitivity range uses.
+    stderr = None
+    sxx = float(np.sum((x - x.mean()) ** 2))
+    if len(x) > 2 and sxx > 0:
+        stderr = float(np.sqrt((ss_res / (len(x) - 2)) / sxx))
+    if stderr is not None and np.isfinite(stderr):
+        band = [
+            round(float(np.clip(clipped - 1.96 * stderr, -4.0, -0.1)), 2),
+            round(float(np.clip(clipped + 1.96 * stderr, -4.0, -0.1)), 2),
+        ]
+    else:
+        stderr = None
+        band = [round(clipped * 0.7, 2), round(min(clipped * 1.3, -0.1), 2)]
 
     return {
-        "value": round(float(np.clip(slope, -4.0, -0.1)), 2),
+        "value": round(clipped, 2),
+        "measured": True,
         "method": "OLS on log(quantity) vs log(unit price)",
+        "reason": "estimated from this dataset's own order lines",
         "sample": int(len(work)),
         "r2": round(float(r2), 3) if r2 is not None else None,
+        "stderr": round(stderr, 4) if stderr is not None else None,
+        "band": band,
     }
 
 
@@ -349,7 +404,11 @@ def forecast_sales(
                 }
             )
 
-    elasticity = _elasticity(orders_df) if orders_df is not None else {"value": -1.2, "method": "prior", "sample": 0, "r2": None}
+    elasticity = (
+        _elasticity(orders_df)
+        if orders_df is not None
+        else _assumed_elasticity("no order lines were supplied")
+    )
     gross_margin = None
     if orders_df is not None and not orders_df.empty and "profit" in orders_df.columns:
         total_sales = float(orders_df["sales"].sum())
@@ -391,6 +450,9 @@ def forecast_sales(
         "defaults": {
             "avg_discount_pct": round(avg_discount * 100, 1),
             "price_elasticity": elasticity["value"],
+            "elasticity_measured": bool(elasticity.get("measured")),
+            "elasticity_band": elasticity.get("band"),
+            "elasticity_reason": elasticity.get("reason"),
             "gross_margin_pct": round(gross_margin * 100, 1) if gross_margin else None,
         },
     }
@@ -403,6 +465,8 @@ def simulate_whatif(
     marketing_boost: float = 0,
     horizon_months: int = HORIZON_DEFAULT,
     base: Optional[Dict] = None,
+    marketing_spend: float = 0.0,
+    elasticity_value: Optional[float] = None,
 ) -> Dict:
     """
     Simulate the revenue and profit impact of pricing, discount and marketing changes.
@@ -410,16 +474,26 @@ def simulate_whatif(
     * price change: % change in list price
     * discount change: % change in the discount *level* (e.g. +20 → 15% becomes 18%)
     * marketing boost: % increase in marketing spend, with diminishing returns
+    * marketing_spend: the current spend over the horizon, used to charge the
+      incremental cost of a boost. Left at 0 the spend is not charged and the
+      result says so.
+    * elasticity_value: override the dataset elasticity (used for sensitivity
+      ranges); the reported assumptions always name the value actually used.
 
-    Revenue elasticity comes from the dataset (``elasticity``); profit uses the
-    historical gross margin with unit costs held constant.
+    Revenue elasticity comes from the dataset (``elasticity``, measured or the
+    labelled prior); profit uses the historical gross margin with unit costs held
+    constant, minus any incremental marketing spend.
     """
     base = base or forecast_sales(monthly_df, horizon_months)
 
     if not base.get("has_data") or not base.get("forecast"):
         return {"error": "No data available", **base}
 
-    elasticity = float(base.get("elasticity", {}).get("value", -1.2) or -1.2)
+    elasticity_info = dict(base.get("elasticity") or {})
+    elasticity_overridden = elasticity_value is not None
+    elasticity = float(
+        elasticity_value if elasticity_overridden else elasticity_info.get("value", ELASTICITY_PRIOR)
+    )
     avg_discount = float(base.get("defaults", {}).get("avg_discount_pct", 0.0)) / 100
 
     price_factor = max(1.0 + price_change / 100.0, 0.1)
@@ -484,11 +558,16 @@ def simulate_whatif(
         - marketing_revenue
     )
 
-    # Profit: revenue at the new price minus unit costs scaled by volume.
+    # Profit: revenue at the new price minus unit costs scaled by volume, minus
+    # the incremental marketing spend the boost requires. The baseline spend is
+    # not in the order log, so it is excluded from both sides of the comparison;
+    # only the extra spend caused by the scenario is charged.
     base_profit = base_total * base_margin
     new_revenue = base_total * (effective_price_factor ** (1 + elasticity)) * marketing_factor
     new_cost = base_total * cost_share * total_volume_factor
-    new_profit = new_revenue - new_cost
+    spend_basis = max(float(marketing_spend or 0.0), 0.0)
+    incremental_spend = spend_basis * (marketing_boost / 100.0)
+    new_profit = new_revenue - new_cost - incremental_spend
     profit_impact = new_profit - base_profit
 
     return {
@@ -508,15 +587,35 @@ def simulate_whatif(
             "marketing": round(marketing_revenue, 2),
             "interaction": round(interaction_revenue, 2),
         },
+        "elasticity": {
+            **elasticity_info,
+            "value": round(elasticity, 4),
+            "value_used": round(elasticity, 4),
+            "overridden_for_sensitivity": elasticity_overridden,
+        },
         "assumptions": {
             "price_elasticity": elasticity,
+            "elasticity_measured": bool(elasticity_info.get("measured")),
+            "elasticity_source": elasticity_info.get("method") or "prior",
+            "elasticity_sample": elasticity_info.get("sample"),
+            "elasticity_r2": elasticity_info.get("r2"),
+            "elasticity_note": elasticity_info.get("reason"),
             "avg_discount_pct": round(avg_discount * 100, 1),
             "new_discount_pct": round(new_discount * 100, 1),
             "gross_margin_pct": round(base_margin * 100, 1),
             "volume_factor": round(total_volume_factor, 4),
             "revenue_factor": round(revenue_factor, 4),
             "marketing_lift_pct": round((marketing_factor - 1) * 100, 2),
-            "marketing_spend_not_deducted": marketing_boost > 0,
+            "marketing_spend_basis": round(spend_basis, 2),
+            "incremental_marketing_spend": round(incremental_spend, 2),
+            # True when a boost was requested but no spend baseline was supplied,
+            # so the profit figure excludes marketing cost.
+            "marketing_spend_not_deducted": marketing_boost > 0 and incremental_spend <= 0,
+        },
+        "marketing_spend": {
+            "basis": round(spend_basis, 2),
+            "incremental": round(incremental_spend, 2),
+            "charged": incremental_spend > 0,
         },
         "model": base.get("model"),
         "horizon_months": horizon_months,

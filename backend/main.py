@@ -11,6 +11,7 @@ from routers import (
     auth,
     behavior,
     dashboard,
+    datasets,
     drift,
     forecast,
     rootcause,
@@ -20,13 +21,14 @@ from routers import (
 )
 
 from db.database import engine, Base
-from db.migrate import migrate_legacy_tables
+from db.migrate import ensure_schema, migrate_legacy_tables
 from security import verify_signature
 
 # Drop the old globally shared demo tables before the tenant-scoped schema is
 # created. `users` and every data table are rebuilt empty.
 migrate_legacy_tables(engine)
 Base.metadata.create_all(bind=engine)
+ensure_schema(engine)
 
 app = FastAPI(
     title="BIDS API",
@@ -81,6 +83,7 @@ app.include_router(drift.router,        prefix="/api/drift",      tags=["Data Dr
 app.include_router(forecast.router,     prefix="/api/forecast",   tags=["Forecasting"])
 app.include_router(strategy.router,     prefix="/api/strategy",   tags=["Strategy AI"])
 app.include_router(upload.router,       prefix="/api/upload",     tags=["Data Upload"])
+app.include_router(datasets.router,     prefix="/api/datasets",   tags=["Datasets"])
 app.include_router(analysis.router,     prefix="/api/analysis",   tags=["Analysis Report"])
 
 

@@ -12,10 +12,11 @@ Usage:
 import argparse
 import sys
 import os
-import io
 
-# Fix Windows console encoding for Unicode output
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Only adjust the console encoding when run as a script. Replacing sys.stdout at
+# import time breaks any host process (pytest, uvicorn) that imports this module.
+if __name__ == "__main__" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # Ensure the backend package is on the path
 sys.path.insert(0, os.path.dirname(__file__))

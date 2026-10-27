@@ -103,5 +103,10 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         )
 
     _failures.pop(email, None)
-    has_data = db.query(DatasetMeta).filter(DatasetMeta.owner_id == email).first() is not None
+    active = (
+        db.query(DatasetMeta)
+        .filter(DatasetMeta.owner_id == email, DatasetMeta.is_active == 1)
+        .first()
+    )
+    has_data = bool(active and (active.row_count or 0) > 0)
     return {"user": _public_user(user), "workspace_ready": has_data}

@@ -11,15 +11,47 @@ import { getUploadStatus } from "@/lib/api";
 const STANDALONE_ROUTES = ["/", "/login", "/signup"];
 
 // Analytics modules only make sense once this account has uploaded a dataset.
-const MODULE_ROUTES = [
-  "/dashboard",
-  "/behavior",
-  "/segmentation",
-  "/rootcause",
-  "/drift",
-  "/forecasting",
-  "/analysis",
-];
+// Each route maps to the backend's capability key so a churn or generic dataset
+// does not open pages that would show sales metrics it cannot support.
+const MODULE_ROUTES: Record<string, string> = {
+  "/dashboard": "dashboard",
+  "/behavior": "behavior",
+  "/segmentation": "segmentation",
+  "/rootcause": "rootcause",
+  "/drift": "drift",
+  "/forecasting": "forecast",
+  "/analysis": "analysis",
+};
+
+function WorkspaceUnavailable({ schemaLabel }: { schemaLabel: string }) {
+  return (
+    <div className="panel panel-body animate-fade-up" style={{ textAlign: "center", padding: "68px 28px", maxWidth: 620, margin: "48px auto" }}>
+      <div style={{
+        width: 56, height: 56, borderRadius: 16, background: "#f3f4f6",
+        border: "1px solid var(--border)", display: "flex", alignItems: "center",
+        justifyContent: "center", margin: "0 auto 18px",
+      }}>
+        <ShieldCheck size={22} color="#111111" />
+      </div>
+      <div style={{ fontSize: 19, fontWeight: 800, letterSpacing: -0.3, marginBottom: 8 }}>
+        Not supported by this dataset
+      </div>
+      <p style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6, maxWidth: 440, margin: "0 auto 22px" }}>
+        The active dataset is classified as <strong>{schemaLabel}</strong>. This module needs
+        sales transaction history, so it would only show empty or misleading figures.
+        The Analysis Report explains what this dataset actually supports.
+      </p>
+      <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+        <Link href="/analysis" className="btn-primary" style={{ textDecoration: "none" }}>
+          <ArrowRight size={14} /> Open Analysis Report
+        </Link>
+        <Link href="/upload" className="btn-ghost" style={{ textDecoration: "none" }}>
+          <Upload size={14} /> Upload another dataset
+        </Link>
+      </div>
+    </div>
+  );
+}
 
 function WorkspaceEmpty() {
   return (
@@ -65,11 +97,17 @@ function WorkspaceLoading() {
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const isStandalone = STANDALONE_ROUTES.includes(pathname);
-  const needsData = MODULE_ROUTES.some(
-    (route) => pathname === route || pathname.startsWith(`${route}/`),
+  const route = Object.keys(MODULE_ROUTES).find(
+    (candidate) => pathname === candidate || pathname.startsWith(`${candidate}/`),
   );
+  const needsData = Boolean(route);
   // Keyed by path so a previous route's answer can never authorise the next one.
-  const [probe, setProbe] = useState<{ path: string; hasData: boolean } | null>(null);
+  const [probe, setProbe] = useState<{
+    path: string;
+    hasData: boolean;
+    modules: Record<string, boolean>;
+    schemaLabel: string;
+  } | null>(null);
 
   useEffect(() => {
     if (!needsData) return;
@@ -77,11 +115,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
     getUploadStatus()
       .then((status) => {
-        if (!cancelled) setProbe({ path: pathname, hasData: Boolean(status?.has_data) });
+        if (!cancelled) {
+          setProbe({
+            path: pathname,
+            hasData: Boolean(status?.has_data),
+            modules: (status?.modules as Record<string, boolean>) || {},
+            schemaLabel: (status?.schema_label as string) || "another dataset type",
+          });
+        }
       })
       .catch(() => {
         // Let the module render its own error state if the API is unreachable.
-        if (!cancelled) setProbe({ path: pathname, hasData: true });
+        if (!cancelled) setProbe({ path: pathname, hasData: true, modules: {}, schemaLabel: "" });
       });
 
     return () => { cancelled = true; };
@@ -94,6 +139,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const hasData = probe?.path === pathname ? probe.hasData : null;
   const blocked = needsData && hasData === false;
   const checking = needsData && hasData === null;
+  const moduleKey = route ? MODULE_ROUTES[route] : undefined;
+  const supported = moduleKey && probe ? probe.modules[moduleKey] !== false : true;
+  // The Analysis Report always works; it adapts to the dataset it is given.
+  const unavailable = needsData && hasData === true && !supported;
 
   return (
     <div className="app-shell">
@@ -101,7 +150,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <div style={{ display: "flex", flexDirection: "column", flex: 1, overflow: "hidden" }}>
         <TopBar />
         <main className="main-content">
-          {blocked ? <WorkspaceEmpty /> : checking ? <WorkspaceLoading /> : children}
+          {blocked ? <WorkspaceEmpty />
+            : checking ? <WorkspaceLoading />
+            : unavailable ? <WorkspaceUnavailable schemaLabel={probe?.schemaLabel || "another dataset type"} />
+            : children}
         </main>
       </div>
     </div>

@@ -14,6 +14,9 @@ from db.database import get_db
 from ml.root_cause import build_fishbone, detect_anomalies, explain_anomaly, seasonal_baseline
 from security import require_user
 from services.analytics import load_orders_df, monthly_frame, money
+from services.dataset import gate_module
+from services.ingestion import active_dataset
+from services.modules import build_module
 
 router = APIRouter()
 
@@ -24,6 +27,14 @@ def get_rootcause(
     db: Session = Depends(get_db),
     owner: str = Depends(require_user),
 ):
+    meta = active_dataset(db, owner)
+    if meta is not None and meta.schema_kind != "sales":
+        return build_module(db, owner, "rootcause")
+
+    blocked = gate_module(db, owner, "rootcause")
+    if blocked:
+        return blocked
+
     df = load_orders_df(db, owner, with_customer=True)
     if df.empty:
         return {

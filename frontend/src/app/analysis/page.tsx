@@ -4,8 +4,11 @@ import {
   FileBarChart2, Building2, Activity, TrendingUp, TrendingDown,
   AlertTriangle, CheckCircle2, Zap, Users, ShoppingCart,
   DollarSign, Target, ArrowRight, RefreshCw, Info, BarChart3,
+  Layers, ArrowUpRight, ShieldAlert,
 } from "lucide-react";
 import { getAnalysisReport } from "@/lib/api";
+import AdaptiveReport, { type AdaptiveReportData } from "@/components/AdaptiveReport";
+import ReportExportButtons from "@/components/ReportExportButtons";
 import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid, Cell, PieChart, Pie, Legend,
@@ -41,6 +44,10 @@ interface ActionItem {
   priority: number; area: string; action: string; impact: string; effort: string;
 }
 interface AnalysisData {
+  compatible?: boolean;
+  mode?: string;
+  dataset_type?: string;
+  message?: string;
   org: {
     org_name: string | null; dataset_name: string; uploaded_at: string | null;
     row_count: number; customer_count: number; total_sales: number;
@@ -148,6 +155,13 @@ function KpiCard({ label, data, icon }: { label: string; data: KpiEntry; icon: R
 }
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
+function apiErrorMessage(error: unknown): string {
+  const response = (error as { response?: { data?: unknown } })?.response?.data;
+  if (typeof response === "string") return response;
+  const detail = (response as { detail?: unknown })?.detail;
+  return typeof detail === "string" ? detail : "Failed to load analysis. Please upload a dataset first.";
+}
+
 export default function AnalysisPage() {
   const [data, setData] = useState<AnalysisData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -157,14 +171,21 @@ export default function AnalysisPage() {
   const load = () => {
     setLoading(true); setError("");
     getAnalysisReport()
-      .then((d) => { setData(d); setLoading(false); })
-      .catch((e: any) => {
-        setError(e?.response?.data?.detail || "Failed to load analysis. Please upload a dataset first.");
+      .then((payload) => { setData(payload); setLoading(false); })
+      .catch((requestError: unknown) => {
+        setError(apiErrorMessage(requestError));
         setLoading(false);
       });
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    getAnalysisReport()
+      .then((payload) => { if (!cancelled) setData(payload); })
+      .catch((requestError: unknown) => { if (!cancelled) setError(apiErrorMessage(requestError)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
 
   if (loading) return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "60vh", flexDirection: "column", gap: 16 }}>
@@ -177,12 +198,170 @@ export default function AnalysisPage() {
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "60vh", gap: 16, textAlign: "center" }}>
       <AlertTriangle size={36} color="#dc2626" />
       <div style={{ fontSize: 18, color: "#000000", fontWeight: 700 }}>Analysis Unavailable</div>
-      <div style={{ fontSize: 13, color: "var(--text-secondary)", maxWidth: 400 }}>{error}</div>
+      <div style={{ fontSize: 13, color: "var(--text-secondary)", maxWidth: 460, lineHeight: 1.6 }}>{error}</div>
       <a href="/upload" className="btn-primary" style={{ marginTop: 8 }}>Upload Dataset <ArrowRight size={14} /></a>
     </div>
   );
 
   if (!data) return null;
+
+  // Non-sales datasets get the adaptive report: profiling, EDA and the task
+  // the data actually supports (never sales metrics).
+  if (data.mode === "adaptive") {
+    return (
+      <AdaptiveReport
+        report={data as unknown as AdaptiveReportData}
+        onRefresh={load}
+      />
+    );
+  }
+
+  // ── Incompatible Dataset Screen (e.g. Telecom Customer Churn) ───────────────
+  if (data.compatible === false) {
+    const org = data.org;
+    return (
+      <div>
+        <div className="page-header">
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+            <div>
+              <div className="page-title">
+                <div className="page-title-icon">
+                  <FileBarChart2 size={18} />
+                </div>
+                Analysis Report
+              </div>
+              <p className="page-subtitle">
+                Deep organizational intelligence and sales revenue audit.
+              </p>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <ReportExportButtons />
+              <button id="refresh-analysis" className="btn-ghost" onClick={load} style={{ fontSize: 12, gap: 6 }}>
+                <RefreshCw size={13} /> Refresh
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Dataset Meta Banner */}
+        <div className="panel panel-body animate-fade-up" style={{ marginBottom: 20, opacity: 0, background: "#ffffff", border: "1px solid var(--border)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            <div style={{ width: 48, height: 48, borderRadius: 12, background: "#000000", color: "#ffffff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <Building2 size={22} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 20, fontWeight: 800, color: "#000000", letterSpacing: -0.5 }}>
+                {org.org_name || "Your Organization"}
+              </div>
+              <div style={{ fontSize: 12.5, color: "var(--text-secondary)", marginTop: 2 }}>
+                {org.dataset_name} · {org.row_count?.toLocaleString()} subscriber records · Customer Churn Analysis
+              </div>
+            </div>
+            {org.uploaded_at && (
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontSize: 11, color: "var(--text-muted)" }}>Loaded At</div>
+                <div style={{ fontSize: 12, color: "var(--text-primary)", fontWeight: 600 }}>
+                  {new Date(org.uploaded_at).toLocaleString()}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Compatibility Notice Panel */}
+        <div className="panel panel-body animate-fade-up" style={{ marginBottom: 24, padding: "32px", border: "1px solid #fed7aa", background: "#fffaf5" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 18 }}>
+            <div style={{ width: 44, height: 44, borderRadius: 10, background: "#ffedd5", color: "#ea580c", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <ShieldAlert size={24} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 6 }}>
+                <span style={{ fontSize: 17, fontWeight: 800, color: "#9a3412" }}>
+                  Sales Analysis Report Incompatible with Churn Data
+                </span>
+                <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 4, background: "#ffedd5", color: "#c2410c", border: "1px solid #fed7aa" }}>
+                  Telecom Customer Churn
+                </span>
+              </div>
+              <p style={{ fontSize: 13, color: "#7c2d12", lineHeight: 1.65, marginBottom: 16 }}>
+                {data.message || (
+                  "The BIDS Analysis Report calculates deep sales transaction intelligence: multi-period revenue drift, product profit margins, order velocity, repeat purchase rates, and revenue drop root-cause fishbone diagrams. Because churn datasets contain subscriber tenure, call minutes, usage charges, and churn status rather than transactional sales orders, BIDS preserves your analytical truthfulness by not fabricating fake sales dates or profit margins."
+                )}
+              </p>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "#9a3412", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 12 }}>
+                Recommended Modules for Churn Analysis
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
+                <a
+                  href="/behavior"
+                  style={{
+                    display: "block",
+                    padding: "14px 16px",
+                    borderRadius: 8,
+                    background: "#ffffff",
+                    border: "1px solid #fed7aa",
+                    textDecoration: "none",
+                    color: "inherit",
+                    transition: "all 0.2s ease",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span style={{ fontSize: 13.5, fontWeight: 700, color: "#000000" }}>Customer Behavior</span>
+                    <ArrowUpRight size={14} color="#ea580c" />
+                  </div>
+                  <p style={{ fontSize: 12, color: "var(--text-secondary)", margin: 0, lineHeight: 1.45 }}>
+                    Inspect subscriber activity, calling cadence, usage intensity, and engagement cohorts.
+                  </p>
+                </a>
+                <a
+                  href="/segmentation"
+                  style={{
+                    display: "block",
+                    padding: "14px 16px",
+                    borderRadius: 8,
+                    background: "#ffffff",
+                    border: "1px solid #fed7aa",
+                    textDecoration: "none",
+                    color: "inherit",
+                    transition: "all 0.2s ease",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span style={{ fontSize: 13.5, fontWeight: 700, color: "#000000" }}>Customer Segmentation</span>
+                    <ArrowUpRight size={14} color="#ea580c" />
+                  </div>
+                  <p style={{ fontSize: 12, color: "var(--text-secondary)", margin: 0, lineHeight: 1.45 }}>
+                    Explore active vs. churned subscriber breakdown, geographical clusters, and account tiers.
+                  </p>
+                </a>
+                <a
+                  href="/upload"
+                  style={{
+                    display: "block",
+                    padding: "14px 16px",
+                    borderRadius: 8,
+                    background: "#ffffff",
+                    border: "1px solid #fed7aa",
+                    textDecoration: "none",
+                    color: "inherit",
+                    transition: "all 0.2s ease",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span style={{ fontSize: 13.5, fontWeight: 700, color: "#000000" }}>Upload Sales Dataset</span>
+                    <ArrowUpRight size={14} color="#ea580c" />
+                  </div>
+                  <p style={{ fontSize: 12, color: "var(--text-secondary)", margin: 0, lineHeight: 1.45 }}>
+                    Upload e-commerce or retail transactions to generate the complete deep sales intelligence report.
+                  </p>
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const hs = healthStatus(data.health_score);
   const { org, kpis, segmentation, drift_series, anomalies, root_cause, forecast, benchmarks, action_items } = data;
@@ -219,9 +398,12 @@ export default function AnalysisPage() {
               Deep organizational intelligence — every number computed from your uploaded dataset.
             </p>
           </div>
-          <button id="refresh-analysis" className="btn-ghost" onClick={load} style={{ fontSize: 12, gap: 6 }}>
-            <RefreshCw size={13} /> Refresh
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <ReportExportButtons />
+            <button id="refresh-analysis" className="btn-ghost" onClick={load} style={{ fontSize: 12, gap: 6 }}>
+              <RefreshCw size={13} /> Refresh
+            </button>
+          </div>
         </div>
       </div>
 
@@ -357,7 +539,7 @@ export default function AnalysisPage() {
                       <Cell key={s.segment} fill={SEGMENT_COLORS[s.segment] || "#000000"} />
                     ))}
                   </Pie>
-                  <Tooltip formatter={(v: any) => [`${v} customers`]} contentStyle={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: 8, color: "#000000" }} />
+                  <Tooltip formatter={(v: unknown) => [`${v} customers`]} contentStyle={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: 8, color: "#000000" }} />
                 </PieChart>
               </ResponsiveContainer>
             </div>
@@ -435,7 +617,7 @@ export default function AnalysisPage() {
                 }} />
                 <Tooltip
                   contentStyle={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: 12, color: "#000000" }}
-                  formatter={(v: any) => [v != null ? Number(v).toLocaleString() : ""]}
+                  formatter={(v: unknown) => [v != null ? Number(v).toLocaleString() : ""]}
                 />
                 {anomalies.map((a) => (
                   <ReferenceLine key={a.date} x={a.date} stroke="#dc2626" strokeDasharray="4 4" strokeWidth={1.5}
@@ -519,7 +701,7 @@ export default function AnalysisPage() {
                 <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
                 <XAxis dataKey="month" tick={{ fontSize: 10, fill: "#6b7280" }} tickLine={false} />
                 <YAxis tick={{ fontSize: 10, fill: "#6b7280" }} tickLine={false} axisLine={false} width={55} tickFormatter={(v: number) => v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)}M` : v >= 1_000 ? `${(v / 1_000).toFixed(0)}K` : `${v}`} />
-                <Tooltip contentStyle={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: 12, color: "#000000" }} formatter={(v: any) => v != null ? [`$${Number(v).toLocaleString()}`] : ["-"]} />
+                <Tooltip contentStyle={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: 12, color: "#000000" }} formatter={(v: unknown) => v != null ? [`$${Number(v).toLocaleString()}`] : ["-"]} />
                 <Area type="monotone" dataKey="actual"    stroke="#000000" strokeWidth={2} fill="url(#actualGrad)"   dot={false} connectNulls />
                 <Area type="monotone" dataKey="projected" stroke="#4b5563" strokeWidth={2} fill="url(#forecastGrad)" dot={false} strokeDasharray="5 4" connectNulls />
                 <Area type="monotone" dataKey="upper"     stroke="transparent" fill="rgba(0,0,0,0.03)" fillOpacity={1} connectNulls dot={false} />

@@ -144,6 +144,17 @@ def period_stats(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> di
     }
 
 
+def repeat_purchase_rate(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> float:
+    """Share of customers with 2+ orders inside the window (end exclusive)."""
+    window = df[(df["order_date"] >= start) & (df["order_date"] < end)]
+    if window.empty:
+        return 0.0
+    counts = window.groupby("customer_id")["order_id"].nunique()
+    if len(counts) == 0:
+        return 0.0
+    return round(float((counts > 1).sum()) / len(counts) * 100, 1)
+
+
 def retention_snapshot(df: pd.DataFrame, anchor: pd.Timestamp, window_days: int = 90) -> dict:
     """
     Retention / churn / acquisition over the trailing window, anchored at the
@@ -223,11 +234,11 @@ def recalculate_kpis(db: Session, owner_id: str) -> None:
         series = monthly[column].astype(float).tolist()
         drift_scores[name] = detect_drift_adwin(series)["drift_score"] if len(series) >= 3 else 0.0
 
-    repeat_counts = df.groupby("customer_id")["order_id"].nunique()
-    repeat_rate = (
-        round(float((repeat_counts > 1).sum()) / len(repeat_counts) * 100, 1)
-        if len(repeat_counts)
-        else 0.0
+    repeat_now = repeat_purchase_rate(
+        df, anchor - pd.Timedelta(days=window), anchor
+    )
+    repeat_before = repeat_purchase_rate(
+        df, anchor - pd.Timedelta(days=window * 2), anchor - pd.Timedelta(days=window)
     )
 
     definitions = [
@@ -257,9 +268,9 @@ def recalculate_kpis(db: Session, owner_id: str) -> None:
         },
         {
             "kpi_name": "Repeat Purchase Rate",
-            "current_value": repeat_rate,
-            "baseline_value": round(max(repeat_rate - 3.0, 0.0), 1),
-            "target_value": round(min(repeat_rate * 1.15, 100), 1),
+            "current_value": repeat_now,
+            "baseline_value": repeat_before,
+            "target_value": round(min(repeat_now * 1.15, 100), 1),
             "drift_score": drift_scores.get("Orders", 0.0),
             "unit": "%",
         },
@@ -276,7 +287,7 @@ def recalculate_kpis(db: Session, owner_id: str) -> None:
             "current_value": retention["churn_rate"],
             "baseline_value": retention_previous["churn_rate"],
             "target_value": round(retention["churn_rate"] * 0.85, 1),
-            "drift_score": drift_scores.get("Margin", 0.0),
+            "drift_score": drift_scores.get("Profit Margin", 0.0),
             "unit": "%",
         },
         {

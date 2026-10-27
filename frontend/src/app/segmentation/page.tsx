@@ -8,6 +8,7 @@ import {
   RefreshCw, Sprout, UserX,
 } from "lucide-react";
 import { getSegments } from "@/lib/api";
+import AdaptiveModule, { type AdaptiveModulePayload } from "@/components/AdaptiveModule";
 import { formatCurrency, formatNumber, formatPercent } from "@/lib/format";
 
 ChartJS.register(ArcElement, Tooltip, Legend);
@@ -88,6 +89,10 @@ export default function SegmentationPage() {
     setReloadKey((key) => key + 1);
   };
 
+  const adaptive = data && (data as { mode?: string }).mode === "adaptive"
+    ? (data as unknown as AdaptiveModulePayload)
+    : null;
+
   const header = (
     <div className="page-header" style={{ marginBottom: 18 }}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
@@ -97,7 +102,9 @@ export default function SegmentationPage() {
             Customer Segments
           </div>
           <p className="page-subtitle">
-            Quintile RFM scores clustered with K-Means, then ranked into four business segments.
+            {adaptive
+              ? "K-Means segments built from the dataset's own numeric features, profiled against the observed outcome."
+              : "Quintile RFM scores clustered with K-Means, then ranked into four business segments."}
           </p>
         </div>
         <button className="btn-ghost" onClick={refresh} style={{ fontSize: 12 }}>
@@ -132,6 +139,15 @@ export default function SegmentationPage() {
           <p style={{ fontSize: 13, color: "var(--text-secondary)", maxWidth: 440, margin: "0 auto 18px" }}>{error}</p>
           <button className="btn-primary" onClick={refresh}><RefreshCw size={14} /> Try again</button>
         </div>
+      </div>
+    );
+  }
+
+  if (adaptive) {
+    return (
+      <div>
+        {header}
+        <AdaptiveModule payload={adaptive} onRefresh={refresh} />
       </div>
     );
   }

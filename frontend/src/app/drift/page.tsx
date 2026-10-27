@@ -5,6 +5,7 @@ import {
   Layers, RefreshCw, Save, TrendingUp,
 } from "lucide-react";
 import { getDrift, patchRule } from "@/lib/api";
+import AdaptiveModule, { type AdaptiveModulePayload } from "@/components/AdaptiveModule";
 import { formatCurrency, formatNumber, formatPercent } from "@/lib/format";
 
 type Status = "shifted" | "watch" | "stable";
@@ -342,10 +343,11 @@ export default function DriftPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [reloadKey, setReloadKey] = useState(0);
+  const [referenceId, setReferenceId] = useState<number | undefined>();
 
   useEffect(() => {
     let cancelled = false;
-    getDrift()
+    getDrift(referenceId)
       .then((result) => {
         if (cancelled) return;
         setData(result);
@@ -358,12 +360,16 @@ export default function DriftPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [reloadKey]);
+  }, [reloadKey, referenceId]);
 
   const refresh = () => {
     setLoading(true);
     setReloadKey((key) => key + 1);
   };
+
+  const adaptive = data && (data as { mode?: string }).mode === "adaptive"
+    ? (data as unknown as AdaptiveModulePayload)
+    : null;
 
   const handleRuleUpdate = async (id: number, body: { status?: string }) => {
     await patchRule(id, body);
@@ -379,7 +385,9 @@ export default function DriftPage() {
             Data Drift &amp; BPR
           </div>
           <p className="page-subtitle">
-            ADWIN change points, PSI feature-mix shift, and business rules scored against their own trigger history.
+            {adaptive
+              ? "Distribution shift between comparable datasets or periods, measured with PSI and distribution tests."
+              : "ADWIN change points, PSI feature-mix shift, and business rules scored against their own trigger history."}
           </p>
         </div>
         <button className="btn-ghost" onClick={refresh} style={{ fontSize: 12 }}>
@@ -412,6 +420,22 @@ export default function DriftPage() {
           <p style={{ fontSize: 13, color: "var(--text-secondary)", maxWidth: 440, margin: "0 auto 18px" }}>{error}</p>
           <button className="btn-primary" onClick={refresh}><RefreshCw size={14} /> Try again</button>
         </div>
+      </div>
+    );
+  }
+
+  if (adaptive) {
+    return (
+      <div>
+        {header}
+        <AdaptiveModule
+          payload={adaptive}
+          onRefresh={refresh}
+          onSelectReference={(dataset) => {
+            setLoading(true);
+            setReferenceId(dataset.id);
+          }}
+        />
       </div>
     );
   }

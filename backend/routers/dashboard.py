@@ -16,6 +16,9 @@ from sqlalchemy.orm import Session
 from db.database import get_db
 from db.models import DatasetMeta, KPI
 from security import require_user
+from services.dataset import gate_module
+from services.ingestion import active_dataset
+from services.modules import build_module
 from services.analytics import (
     load_orders_df,
     monthly_frame,
@@ -34,7 +37,7 @@ def _percent(part: float, total: float) -> float:
 
 
 def _dataset_meta(db: Session, df: pd.DataFrame, owner_id: str) -> dict:
-    meta = db.query(DatasetMeta).filter(DatasetMeta.owner_id == owner_id).first()
+    meta = active_dataset(db, owner_id)
     return {
         "dataset_name": meta.dataset_name if meta else "Seeded dataset",
         "org_name": meta.org_name if meta else None,
@@ -278,6 +281,28 @@ def get_dashboard(
     db: Session = Depends(get_db),
     owner: str = Depends(require_user),
 ):
+    meta = active_dataset(db, owner)
+    if meta is None:
+        return {
+            "has_data": False,
+            "compatible": True,
+            "meta": None,
+            "period": None,
+            "kpis": [],
+            "revenue_trend": [],
+            "category_breakdown": [],
+            "subcategory_performance": [],
+            "region_breakdown": [],
+            "alerts": [],
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+    if meta.schema_kind != "sales":
+        return build_module(db, owner, "dashboard")
+
+    blocked = gate_module(db, owner, "dashboard")
+    if blocked:
+        return blocked
+
     df = load_orders_df(db, owner, with_customer=True)
     if df.empty:
         return {

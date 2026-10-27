@@ -6,7 +6,7 @@ import {
   Activity, AlertTriangle, ArrowRight, BarChart3, CheckCircle2,
   Database, FileBarChart2, Home, LayoutDashboard, Layers, PieChart,
   Search, ShieldCheck, Sparkles, TrendingUp, Upload, Zap,
-  Cpu, ArrowUpRight, Clock,
+  Cpu, ArrowUpRight, Clock, type LucideIcon,
 } from "lucide-react";
 import { getUploadStatus, getHealthScore } from "@/lib/api";
 import { formatCurrency, formatNumber } from "@/lib/format";
@@ -17,7 +17,7 @@ interface ModuleCardDef {
   category: "Executive" | "Customer" | "Diagnostics" | "Predictive" | "Data";
   categoryLabel: string;
   href: string;
-  icon: any;
+  icon: LucideIcon;
   tag: string;
   tagType: "success" | "info" | "warning" | "neutral";
   summary: string;
@@ -142,17 +142,33 @@ const CATEGORIES = [
   { id: "Data", label: "Data Pipeline" },
 ];
 
+interface WorkspaceStatus {
+  has_data?: boolean;
+  dataset_name?: string;
+  org_name?: string;
+  order_count?: number;
+  customer_count?: number;
+}
+
+interface WorkspaceHealth {
+  score?: number;
+  status?: string;
+}
+
 export default function HomePage() {
   const { data: session } = useSession();
   const [selectedCategory, setSelectedCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [status, setStatus] = useState<any>(null);
-  const [health, setHealth] = useState<any>(null);
+  const [status, setStatus] = useState<WorkspaceStatus | null>(null);
+  const [health, setHealth] = useState<WorkspaceHealth | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
-    Promise.allSettled([getUploadStatus(), getHealthScore()]).then(([statusRes, healthRes]) => {
+    Promise.allSettled([
+      getUploadStatus() as Promise<WorkspaceStatus>,
+      getHealthScore() as Promise<WorkspaceHealth>,
+    ]).then(([statusRes, healthRes]) => {
       if (cancelled) return;
       if (statusRes.status === "fulfilled") setStatus(statusRes.value);
       if (healthRes.status === "fulfilled") setHealth(healthRes.value);

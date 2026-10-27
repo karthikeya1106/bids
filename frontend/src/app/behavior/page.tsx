@@ -10,6 +10,7 @@ import {
   Percent, RefreshCw, Repeat, ShoppingCart, Truck, Users,
 } from "lucide-react";
 import { getBehavior } from "@/lib/api";
+import AdaptiveModule, { type AdaptiveModulePayload } from "@/components/AdaptiveModule";
 import { formatCurrency, formatNumber, formatPercent } from "@/lib/format";
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Tooltip, Legend);
@@ -108,12 +109,14 @@ export default function BehaviorPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [reloadKey]);
-
-  const refresh = () => {
+  }, [reloadKey]);  const refresh = () => {
     setLoading(true);
     setReloadKey((key) => key + 1);
   };
+
+  const adaptive = data && (data as { mode?: string }).mode === "adaptive"
+    ? (data as unknown as AdaptiveModulePayload)
+    : null;
 
   const header = (
     <div className="page-header" style={{ marginBottom: 18 }}>
@@ -123,7 +126,11 @@ export default function BehaviorPage() {
             <div className="page-title-icon"><Activity size={18} /></div>
             Behavior Analytics
           </div>
-          <p className="page-subtitle">Purchase cadence, retention cohorts, discount sensitivity and lifecycle depth.</p>
+          <p className="page-subtitle">
+            {adaptive
+              ? "Measured relationships between the available customer attributes and the observed outcome."
+              : "Purchase cadence, retention cohorts, discount sensitivity and lifecycle depth."}
+          </p>
         </div>
         <button className="btn-ghost" onClick={refresh} style={{ fontSize: 12 }}>
           <RefreshCw size={13} /> Refresh
@@ -155,6 +162,15 @@ export default function BehaviorPage() {
           <p style={{ fontSize: 13, color: "var(--text-secondary)", maxWidth: 440, margin: "0 auto 18px" }}>{error}</p>
           <button className="btn-primary" onClick={refresh}><RefreshCw size={14} /> Try again</button>
         </div>
+      </div>
+    );
+  }
+
+  if (adaptive) {
+    return (
+      <div>
+        {header}
+        <AdaptiveModule payload={adaptive} onRefresh={refresh} />
       </div>
     );
   }

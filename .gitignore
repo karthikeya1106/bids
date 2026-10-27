@@ -41,3 +41,14 @@ Thumbs.db
 
 # One-off legacy demo database backup created by the tenant migration
 *.legacy-demo-backup
+
+# Development logs
+backend/uvicorn.dev.log
+
+# Python cache
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+
+# Virtual environment
+venv/

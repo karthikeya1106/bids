@@ -22,6 +22,9 @@ export default function TopBar() {
   const [time, setTime] = useState("");
   const [date, setDate] = useState("");
   const [showMenu, setShowMenu] = useState(false);
+  // Which avatar URL failed to load. Tracking the URL itself means a different
+  // account (new URL) is retried automatically, with no reset effect.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -53,7 +56,11 @@ export default function TopBar() {
     ? session.user.name.split(" ").map((n: string) => n[0]).join("").toUpperCase().slice(0, 2)
     : "U";
 
-  const userImage = session?.user?.image;
+  // Only trust an absolute http(s) URL, and fall back to initials when the
+  // avatar cannot be fetched (blocked host, revoked Google photo, offline).
+  const rawImage = session?.user?.image?.trim() ?? "";
+  const usableImage = /^https?:\/\//i.test(rawImage) ? rawImage : "";
+  const userImage = usableImage && failedSrc !== usableImage ? usableImage : "";
 
   return (
     <header className="topbar">
@@ -106,7 +113,7 @@ export default function TopBar() {
             onClick={() => setShowMenu(!showMenu)}
             style={{
               width: 32, height: 32, borderRadius: "50%",
-              background: userImage ? "transparent" : "#000000",
+              background: "#000000",
               border: "1px solid var(--border)",
               display: "flex", alignItems: "center", justifyItems: "center", justifyContent: "center",
               cursor: "pointer", padding: 0, overflow: "hidden",
@@ -116,7 +123,13 @@ export default function TopBar() {
           >
             {userImage ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={userImage} alt="avatar" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              <img
+                src={userImage}
+                alt=""
+                referrerPolicy="no-referrer"
+                onError={() => setFailedSrc(userImage)}
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              />
             ) : (
               <span style={{ fontSize: 11, fontWeight: 800, color: "#ffffff" }}>{userInitials}</span>
             )}

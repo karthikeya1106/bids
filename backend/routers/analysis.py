@@ -5,13 +5,22 @@ Endpoints:
   GET /api/analysis/report       — Full analysis: KPIs, segmentation, drift, root cause, forecast, AI strategy
   GET /api/analysis/health-score — Single 0-100 org-health score
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from db.database import get_db
 from db.models import Order, Customer, KPI, DatasetMeta
 from ml.root_cause import detect_anomalies, build_fishbone, explain_anomaly
 from security import require_user
+from services import cache
+from services.adaptive import build_adaptive_report
+from services.capabilities import build_capabilities
+from services.ingestion import active_dataset, dataset_payload
+from services.profiling import profile_dataframe
+from services.report_export import build_pdf, build_xlsx, report_filename
+from services.schemas import get_schema
+
+import json
 
 import pandas as pd
 import numpy as np
@@ -320,7 +329,7 @@ def _generate_action_items(kpis: dict, segmentation: list, top_root_cause: dict,
         })
 
     # Top root cause
-    if top_root_cause.get("factor") and top_root_cause.get("confidence", 0) > 0.5:
+    if top_root_cause and isinstance(top_root_cause, dict) and top_root_cause.get("factor") and top_root_cause.get("confidence", 0) > 0.5:
         actions.append({
             "priority": 4,
             "area": "Root Cause",
@@ -344,6 +353,102 @@ def _generate_action_items(kpis: dict, segmentation: list, top_root_cause: dict,
     return sorted(actions, key=lambda x: x["priority"])[:6]
 
 
+# ─── Adaptive report (non-sales datasets) ────────────────────────────────────
+
+def _adaptive_report(db: Session, owner: str, meta: DatasetMeta) -> dict:
+    """Dataset-specific report: profiling, EDA and the supported modelling task.
+
+    Building it profiles the frame and re-fits the task model, which is seconds
+    of CPU on a mid-sized dataset. The result only depends on the dataset
+    revision, so it is cached like the module payloads.
+    """
+    signature = cache.dataset_signature(meta)
+    cache_key = (signature, "report") if signature else None
+    cached = cache.get_payload(cache_key)
+    if cached is not None:
+        return cached
+
+    capabilities, df = build_capabilities(db, owner, meta)
+    if df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail="The active dataset has no stored rows. Re-upload it or activate another dataset.",
+        )
+
+    profile = profile_dataframe(df)
+    try:
+        validation = json.loads(meta.validation_json or "{}")
+    except ValueError:
+        validation = {}
+    schema = get_schema(meta.schema_kind)
+    adaptive = build_adaptive_report(
+        df,
+        profile,
+        meta.schema_kind,
+        meta.analysis_task or "eda",
+        meta.target_field,
+        validation,
+    )
+    time_coverage = profile.get("time_coverage") or {}
+
+    report = {
+        "compatible": True,
+        "mode": "adaptive",
+        "dataset_type": meta.schema_kind,
+        "schema_label": schema.label,
+        "schema_description": schema.description,
+        "org": {
+            "org_name": meta.org_name,
+            "dataset_name": meta.dataset_name,
+            "uploaded_at": str(meta.uploaded_at) if meta.uploaded_at else None,
+            "row_count": meta.row_count,
+            "customer_count": meta.customer_count,
+            "total_sales": meta.total_sales,
+            "date_from": time_coverage.get("from"),
+            "date_to": time_coverage.get("to"),
+        },
+        "health_score": None,
+        "task": meta.analysis_task,
+        "target": meta.target_field,
+        "profile": {
+            "rows": profile["rows"],
+            "columns": profile["columns"],
+            "duplicate_rows": profile["duplicate_rows"],
+            "missing_pct": profile["missing_pct"],
+            "type_counts": profile["type_counts"],
+            "quality": profile["quality"][:20],
+            "time_coverage": profile.get("time_coverage"),
+            "correlations": profile.get("correlations", []),
+            "column_profiles": [
+                {
+                    "name": column["name"],
+                    "dtype": column["dtype"],
+                    "missing_pct": column["missing_pct"],
+                    "unique": column["unique"],
+                    "mean": column.get("mean"),
+                    "min": column.get("min"),
+                    "max": column.get("max"),
+                }
+                for column in profile["column_profiles"][:40]
+            ],
+        },
+        "adaptive": adaptive,
+        "capabilities": capabilities,
+        "target_suggestion": (
+            next(
+                (entry for entry in capabilities.get("target_suggestions", []) if entry.get("suggested")),
+                None,
+            )
+            if not (capabilities.get("target") or {}).get("confirmed")
+            else None
+        ),
+        "notes": (validation.get("notes") or [])[:10],
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+    cache.put_payload(cache_key, report)
+    return report
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @router.get("/report")
@@ -356,11 +461,24 @@ def get_analysis_report(
     org identity, health score, KPIs, segmentation, drift series,
     root cause fishbone, 6-month forecast, and priority action items.
     """
-    meta = db.query(DatasetMeta).filter(DatasetMeta.owner_id == owner).first()
-    df   = _get_orders_df(db, owner)
+    meta = active_dataset(db, owner)
+    if meta is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No dataset is registered for this workspace. Upload a dataset first.",
+        )
 
+    # Non-sales datasets get their own adaptive report: profiling, EDA and the
+    # modelling task the data supports. They are never shown sales metrics.
+    if meta.schema_kind != "sales":
+        return _adaptive_report(db, owner, meta)
+
+    df = _get_orders_df(db, owner)
     if df.empty:
-        raise HTTPException(status_code=404, detail="No data loaded. Please upload a dataset first.")
+        raise HTTPException(
+            status_code=404,
+            detail="The active sales dataset has no usable order rows. Re-upload it or activate another dataset.",
+        )
 
     # ── KPIs ──────────────────────────────────────────────────────────────
     kpis = _compute_kpis(df)
@@ -393,7 +511,8 @@ def get_analysis_report(
     health_score = _compute_health_score(kpis, segmentation, anomalies, df)
 
     # ── Priority action items ──────────────────────────────────────────────
-    action_items = _generate_action_items(kpis, segmentation, fishbone_result.get("top_root_cause", {}), health_score)
+    top_root = (fishbone_result.get("top_root_cause") or {}) if isinstance(fishbone_result, dict) else {}
+    action_items = _generate_action_items(kpis, segmentation, top_root, health_score)
 
     # ── Org identity ──────────────────────────────────────────────────────
     org_info = {
@@ -408,6 +527,10 @@ def get_analysis_report(
     }
 
     return {
+        "compatible":     True,
+        "mode":           "sales",
+        "dataset_type":   "sales",
+        "schema_label":   "Sales & Revenue Analytics",
         "org":            org_info,
         "health_score":   health_score,
         "kpis":           kpis,
@@ -422,9 +545,56 @@ def get_analysis_report(
     }
 
 
+@router.get("/report/export.pdf")
+def export_report_pdf(
+    db: Session = Depends(get_db),
+    owner: str = Depends(require_user),
+):
+    """Download the same report the page shows, rendered as a PDF."""
+    report = get_analysis_report(db=db, owner=owner)
+    return Response(
+        content=build_pdf(report),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{report_filename(report, "pdf")}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/report/export.xlsx")
+def export_report_xlsx(
+    db: Session = Depends(get_db),
+    owner: str = Depends(require_user),
+):
+    """Download the same report as a workbook: one sheet per section, plus notes."""
+    report = get_analysis_report(db=db, owner=owner)
+    return Response(
+        content=build_xlsx(report),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{report_filename(report, "xlsx")}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.get("/health-score")
 def get_health_score(db: Session = Depends(get_db), owner: str = Depends(require_user)):
     """Returns a single 0–100 org health score derived from this workspace's dataset."""
+    meta = active_dataset(db, owner)
+    if meta is not None and meta.schema_kind != "sales":
+        label = get_schema(meta.schema_kind).label
+        return {
+            "score": None,
+            "status": f"N/A ({label})",
+            "mode": "adaptive",
+            "message": (
+                "A sales health score would require revenue, margin and order "
+                "timelines. This dataset is not a sales history."
+            ),
+        }
+
     df = _get_orders_df(db, owner)
     if df.empty:
         return {"score": 0, "status": "No Data"}

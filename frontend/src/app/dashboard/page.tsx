@@ -12,6 +12,7 @@ import {
   TrendingUp, Upload, Users,
 } from "lucide-react";
 import { getDashboard } from "@/lib/api";
+import AdaptiveModule, { type AdaptiveModulePayload } from "@/components/AdaptiveModule";
 import {
   deltaTone, formatCompact, formatCurrency, formatDelta,
   formatNumber, formatPercent,
@@ -209,6 +210,10 @@ export default function DashboardPage() {
     },
   };
 
+  const adaptive = data && (data as { mode?: string }).mode === "adaptive"
+    ? (data as unknown as AdaptiveModulePayload)
+    : null;
+
   const header = (
     <div className="page-header" style={{ marginBottom: 18 }}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
@@ -218,20 +223,24 @@ export default function DashboardPage() {
             Executive Dashboard
           </div>
           <p className="page-subtitle">
-            Trailing 90 days against the previous 90 — computed from the loaded order history.
+            {adaptive
+              ? "Business KPIs and outcome comparisons computed from the active dataset."
+              : "Trailing 90 days against the previous 90 — computed from the loaded order history."}
           </p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <select
-            value={months}
-            onChange={(e) => { setLoading(true); setMonths(Number(e.target.value)); }}
-            aria-label="Trend range"
-            style={{ fontSize: 12, padding: "7px 10px" }}
-          >
-            <option value={6}>Last 6 months</option>
-            <option value={12}>Last 12 months</option>
-            <option value={24}>Last 24 months</option>
-          </select>
+          {!adaptive && (
+            <select
+              value={months}
+              onChange={(e) => { setLoading(true); setMonths(Number(e.target.value)); }}
+              aria-label="Trend range"
+              style={{ fontSize: 12, padding: "7px 10px" }}
+            >
+              <option value={6}>Last 6 months</option>
+              <option value={12}>Last 12 months</option>
+              <option value={24}>Last 24 months</option>
+            </select>
+          )}
           <button className="btn-ghost" onClick={refresh} style={{ fontSize: 12 }}>
             <RefreshCw size={13} /> Refresh
           </button>
@@ -263,6 +272,15 @@ export default function DashboardPage() {
           <p style={{ fontSize: 13, color: "var(--text-secondary)", maxWidth: 440, margin: "0 auto 18px" }}>{error}</p>
           <button className="btn-primary" onClick={refresh}><RefreshCw size={14} /> Try again</button>
         </div>
+      </div>
+    );
+  }
+
+  if (adaptive) {
+    return (
+      <div>
+        {header}
+        <AdaptiveModule payload={adaptive} onRefresh={refresh} />
       </div>
     );
   }

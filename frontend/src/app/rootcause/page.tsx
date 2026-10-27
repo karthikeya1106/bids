@@ -10,6 +10,7 @@ import {
   Layers, RefreshCw, TrendingDown, TrendingUp,
 } from "lucide-react";
 import { getRootCause } from "@/lib/api";
+import AdaptiveModule, { type AdaptiveModulePayload } from "@/components/AdaptiveModule";
 import { formatCompact, formatCurrency, formatNumber, formatPercent } from "@/lib/format";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
@@ -198,6 +199,15 @@ export default function RootCausePage() {
     return () => { cancelled = true; };
   }, [month, reloadKey]);
 
+  const refresh = () => {
+    setLoading(true);
+    setReloadKey((key) => key + 1);
+  };
+
+  const adaptive = data && (data as { mode?: string }).mode === "adaptive"
+    ? (data as unknown as AdaptiveModulePayload)
+    : null;
+
   const header = (
     <div className="page-header" style={{ marginBottom: 18 }}>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
@@ -207,7 +217,9 @@ export default function RootCausePage() {
             Root Cause Analysis
           </div>
           <p className="page-subtitle">
-            Seasonally adjusted anomaly detection, revenue-gap decomposition and an Ishikawa causal tree.
+            {adaptive
+              ? "Statistically tested drivers behind the observed outcome, with effect sizes and correction for multiple comparisons."
+              : "Seasonally adjusted anomaly detection, revenue-gap decomposition and an Ishikawa causal tree."}
           </p>
         </div>
         <button className="btn-ghost" onClick={() => selectMonth(null)} style={{ fontSize: 12 }}>
@@ -240,6 +252,15 @@ export default function RootCausePage() {
           <p style={{ fontSize: 13, color: "var(--text-secondary)", maxWidth: 440, margin: "0 auto 18px" }}>{error}</p>
           <button className="btn-primary" onClick={reload}><RefreshCw size={14} /> Try again</button>
         </div>
+      </div>
+    );
+  }
+
+  if (adaptive) {
+    return (
+      <div>
+        {header}
+        <AdaptiveModule payload={adaptive} onRefresh={refresh} />
       </div>
     );
   }

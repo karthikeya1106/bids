@@ -14,6 +14,9 @@ from sqlalchemy.orm import Session
 from db.database import get_db
 from security import require_user
 from services.analytics import load_orders_df, money, retention_snapshot
+from services.dataset import gate_module
+from services.ingestion import active_dataset
+from services.modules import build_module
 
 router = APIRouter()
 
@@ -338,6 +341,16 @@ def _region_behavior(df: pd.DataFrame) -> list[dict]:
 
 @router.get("")
 def get_behavior(db: Session = Depends(get_db), owner: str = Depends(require_user)):
+    meta = active_dataset(db, owner)
+    if meta is None:
+        return _empty_response()
+    if meta.schema_kind != "sales":
+        return build_module(db, owner, "behavior")
+
+    blocked = gate_module(db, owner, "behavior")
+    if blocked:
+        return blocked
+
     df = load_orders_df(db, owner, with_customer=True)
     if df.empty:
         return _empty_response()

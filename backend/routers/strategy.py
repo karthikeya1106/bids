@@ -8,7 +8,8 @@ key is configured and always falls back to the measured playbook.
 from datetime import datetime
 
 import pandas as pd
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db.database import get_db
@@ -23,10 +24,19 @@ from ml.strategy_llm import (
 from security import require_user
 from seed_bpr import ensure_bpr_rules
 from services.analytics import load_orders_df, monthly_frame
+from services.dataset import gate_module
+from services.ingestion import active_dataset
+from services.modules import build_module
+from services.scenarios import simulate_plays
 
 router = APIRouter()
 
 DEEP_DISCOUNT = 0.20
+
+
+class ScenarioRequest(BaseModel):
+    horizon_months: int = Field(6, ge=3, le=12)
+    marketing_spend: float = Field(0, ge=0, le=50_000_000)
 
 
 def _collect(db: Session, owner: str):
@@ -173,6 +183,14 @@ def _collect(db: Session, owner: str):
 
 @router.get("/insights")
 def get_insights(db: Session = Depends(get_db), owner: str = Depends(require_user)):
+    meta = active_dataset(db, owner)
+    if meta is not None and meta.schema_kind != "sales":
+        return build_module(db, owner, "strategy")
+
+    blocked = gate_module(db, owner, "strategy")
+    if blocked:
+        return blocked
+
     collected = _collect(db, owner)
     if collected is None:
         return {
@@ -212,8 +230,74 @@ def get_insights(db: Session = Depends(get_db), owner: str = Depends(require_use
     }
 
 
+@router.post("/scenarios")
+def get_play_scenarios(
+    body: ScenarioRequest,
+    db: Session = Depends(get_db),
+    owner: str = Depends(require_user),
+):
+    """Evaluate each measured play as a demand-simulator scenario.
+
+    The playbook's annual estimate says what is at stake; this says what the
+    play's own mechanism would do to revenue and net profit over the horizon, and
+    how far that moves when the price elasticity is uncertain.
+    """
+    meta = active_dataset(db, owner)
+    if meta is None or meta.schema_kind != "sales":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Play scenarios are simulated on sales revenue. This dataset does not "
+                "have a sales timeline."
+            ),
+        )
+
+    collected = _collect(db, owner)
+    if collected is None:
+        return {
+            "has_data": False,
+            "available": False,
+            "reason": "No sales rows are stored for this workspace.",
+            "plays": {},
+            "simulation": None,
+        }
+
+    df = collected["df"]
+    monthly = monthly_frame(df)
+    series = pd.DataFrame(
+        {
+            "ds": pd.to_datetime(monthly["month"].astype(str) + "-01"),
+            "y": monthly["sales"].astype(float),
+        }
+    )
+    plays = build_playbook(collected["stats"])
+    return {
+        "has_data": True,
+        **simulate_plays(
+            series,
+            df,
+            plays,
+            horizon_months=body.horizon_months,
+            marketing_spend=body.marketing_spend,
+        ),
+    }
+
+
 @router.post("")
 def get_strategy(db: Session = Depends(get_db), owner: str = Depends(require_user)):
+    meta = active_dataset(db, owner)
+    if meta is not None and meta.schema_kind != "sales":
+        payload = build_module(db, owner, "strategy")
+        payload.setdefault("recommendations", [])
+        payload.setdefault("plays", payload.get("sections", []))
+        payload.setdefault("generated_by", "Measured associations")
+        payload["ai_available"] = False
+        return payload
+
+    blocked = gate_module(db, owner, "strategy")
+    if blocked:
+        return blocked
+
     collected = _collect(db, owner)
     if collected is None:
         return {"recommendations": [], "plays": [], "generated_by": "No data"}

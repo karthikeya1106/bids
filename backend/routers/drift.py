@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -18,6 +18,9 @@ from ml.drift_detector import analyze_feature_drift, analyze_kpi_drift, evaluate
 from security import require_user
 from seed_bpr import ensure_bpr_rules
 from services.analytics import load_orders_df, monthly_frame, recalculate_kpis
+from services.dataset import gate_module
+from services.ingestion import active_dataset
+from services.modules import build_module
 
 router = APIRouter()
 
@@ -29,7 +32,19 @@ class RuleUpdateRequest(BaseModel):
 
 
 @router.get("")
-def get_drift(db: Session = Depends(get_db), owner: str = Depends(require_user)):
+def get_drift(
+    reference_id: Optional[int] = Query(None, description="Dataset id to use as the drift baseline"),
+    db: Session = Depends(get_db),
+    owner: str = Depends(require_user),
+):
+    meta = active_dataset(db, owner)
+    if meta is not None and meta.schema_kind != "sales":
+        return build_module(db, owner, "drift", reference_id=reference_id)
+
+    blocked = gate_module(db, owner, "drift")
+    if blocked:
+        return blocked
+
     df = load_orders_df(db, owner, with_customer=True)
 
     kpis = db.query(KPI).filter(KPI.owner_id == owner).all()
@@ -164,6 +179,16 @@ def update_rule(
 @router.post("/recalculate")
 def recalculate(db: Session = Depends(get_db), owner: str = Depends(require_user)):
     """Recompute the KPI table from the loaded orders (used after a data upload)."""
+    meta = active_dataset(db, owner)
+    if meta is None or meta.schema_kind != "sales":
+        raise HTTPException(
+            status_code=400,
+            detail="KPI recalculation applies to sales datasets; this dataset does not use the KPI table.",
+        )
+    blocked = gate_module(db, owner, "drift")
+    if blocked:
+        return blocked
+
     df = load_orders_df(db, owner)
     if df.empty:
         raise HTTPException(status_code=400, detail="No dataset loaded")
